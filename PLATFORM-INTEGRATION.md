@@ -50,3 +50,14 @@ The CI matrix includes Windows, Linux and macOS CPU/native tests; OpenCL
 syntax and RTL simulation run on Linux. Hardware-specific throughput,
 driver compatibility, FPGA timing and 5 GB/s at 25% resource usage require
 physical devices and are not certified by CI.
+
+## DMA record ABI
+
+The optional packJob helper in fpga-packets.cjs packs each block into
+16-byte little-endian records: 8 packed index bytes, a 32-bit control word
+(A bits 0..9, B 10..19, output bytes 20..26, last 27), then four zero bytes.
+The final record pads unused compressed bits with zeros. The helper supports
+caller-owned staging buffers. hardware/s10_dma_stream.v accepts this exact
+128-bit record, checks reserved fields, full input keep and matching TLAST,
+and exposes the existing 512-bit output with keep/last. This is a framing
+wrapper, not a PCIe endpoint, board driver or completed DMA implementation.
