@@ -139,3 +139,5 @@ node tools/benchmark.cjs --size-mib=8 --runs=3 --workers=4 --gpu=0
 The CPU tests need no optional native packages. Run `npm ci --omit=optional` for a CPU-only install. GPU testing requires the OpenCL binding and driver. The workload benchmark generates fixed-seed raw, palette, DEFLATE, and mixed fixtures. It measures packing, verification, and full restores, and compares each restored file with the original digest. It compares serial and worker configurations when the worker count exceeds one. Omit the GPU flag to measure the CPU only.
 
 Transparent Windows application opens and system-wide RAM compression require separate operating-system integration.
+
+See [binary-first mathematical architecture](SYMBOL-MATH-ARCHITECTURE.md) for exact size, throughput and ASIC datapath specifications.

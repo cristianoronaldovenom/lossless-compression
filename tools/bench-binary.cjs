@@ -14,7 +14,13 @@ for (let j=0;j<Math.ceil(raw.length*8/10);j++) {
     acc |= value<<available; available+=10;
     while(available>=8 && cursor<raw.length){raw[cursor++]=acc;acc>>>=8;available-=8;}
 }
-const payload = encodePalette(raw,dictionary);
+const encodeStart=performance.now();
+const encodeCPU=process.cpuUsage();
+let encodedBlocks=0, payload;
+do { payload=encodePalette(raw,dictionary); encodedBlocks++; } while(performance.now()-encodeStart<500);
+const encodeElapsed=(performance.now()-encodeStart)/1000;
+const encodeUsed=process.cpuUsage(encodeCPU);
+console.log(JSON.stringify({encodingGBps:encodedBlocks*raw.length/encodeElapsed/1e9,encodingAverageLogicalCores:(encodeUsed.user+encodeUsed.system)/1e6/encodeElapsed}));
 assert(payload && payload[0]===2 && payload[1]===0);
 const expected = crypto.createHash("sha256").update(raw).digest("hex");
 const hash = data => crypto.createHash("sha256").update(data).digest("hex");

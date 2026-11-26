@@ -51,3 +51,7 @@ and restored SHA-256 hashes, report measured resource usage, and test real
 files; synthetic one-bit data is intentionally favorable. Disk and PCIe can
 limit throughput. The native addon accelerates only binary palettes. Other
 codecs and existing checksum, recovery, and publication rules are unchanged.
+
+## Binary-first architecture and hardware
+
+See [exact architecture and equations](SYMBOL-MATH-ARCHITECTURE.md). Run `node --test test/binary-encode.test.cjs` and `node tools/symbol-math.cjs 65536 2`. Set `S10_DISABLE_BINARY_ENCODE=1` to compare the previous encoder.
