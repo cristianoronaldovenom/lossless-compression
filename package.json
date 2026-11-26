@@ -1,0 +1,16 @@
+{
+  "name": "symbol10",
+  "version": "1.0.0",
+  "private": true,
+  "main": "./symbol10.cjs",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "test": "node symbol10.cjs self-test && node --test test/*.test.cjs",
+    "test:gpu": "node symbol10.cjs self-test --gpu"
+  },
+  "optionalDependencies": {
+    "koffi": "3.3.8"
+  }
+}
