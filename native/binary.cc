@@ -80,6 +80,23 @@ napi_value expand(napi_env env, napi_callback_info info) {
     if (length % 10) std::memcpy(out + 10*full, cache.entries[input[full]].data(), length % 10);
     return result;
 }
+template<unsigned W>
+bool wide_tiles(const uint8_t* in,uint8_t* out,const uint16_t* values,size_t k,size_t groups){
+    constexpr uint32_t mask=(1u<<W)-1;
+    for(size_t i=0;i<groups;i++,in+=W,out+=10){
+        uint64_t packed=0;
+        for(unsigned j=0;j<(W<9?W:8);j++)packed|=uint64_t(in[j])<<(8*j);
+        const uint64_t second=(packed>>(4*W))|(W==9?uint64_t(in[8])<<28:0);
+        const uint32_t a=packed&mask,b=(packed>>W)&mask,c=(packed>>(2*W))&mask,d=(packed>>(3*W))&mask;
+        const uint32_t e=second&mask,f=(second>>W)&mask,g=(second>>(2*W))&mask,h=(second>>(3*W))&mask;
+        if(a>=k||b>=k||c>=k||d>=k||e>=k||f>=k||g>=k||h>=k)return false;
+        const uint32_t x=values[a]|uint32_t(values[b])<<10|uint32_t(values[c])<<20|uint32_t(values[d])<<30;
+        const uint32_t y=values[e]|uint32_t(values[f])<<10|uint32_t(values[g])<<20|uint32_t(values[h])<<30;
+        for(unsigned j=0;j<4;j++){out[j]=uint8_t(x>>(8*j));out[5+j]=uint8_t(y>>(8*j));}
+        out[4]=uint8_t(values[d]>>2);out[9]=uint8_t(values[h]>>2);
+    }
+    return true;
+}
 napi_value expand_palette(napi_env env, napi_callback_info info) {
     size_t argc=4; napi_value args[4],backing,result;
     napi_typedarray_type type; size_t n,off,k; void* source=nullptr; void* palette=nullptr;
@@ -102,20 +119,20 @@ napi_value expand_palette(napi_env env, napi_callback_info info) {
     auto* out=static_cast<uint8_t*>(dest);
     uint32_t acc=0,available=0,output=0,used=0; size_t pos=0,written=0;
     const uint32_t mask=(1u<<width)-1;
-    // Accumulate exactly eight indices and emit ten bytes in grouped stores.
-    for(uint32_t group=0;group<length/10;group++){
-        uint32_t v[8];
-        for(unsigned j=0;j<8;j++){
-            while(available<width){acc|=uint32_t(in[pos++])<<available;available+=8;}
-            const uint32_t ix=acc&mask;acc>>=width;available-=width;
-            if(ix>=k)return fail(env,"Invalid palette index");v[j]=values[ix];
-        }
-        const uint32_t a=v[0]|v[1]<<10|v[2]<<20|v[3]<<30;
-        const uint32_t b=v[4]|v[5]<<10|v[6]<<20|v[7]<<30;
-        // Explicit LE stores preserve format on big-endian hosts.
-        for(unsigned j=0;j<4;j++){out[written+j]=uint8_t(a>>(8*j));out[written+5+j]=uint8_t(b>>(8*j));}
-        out[written+4]=uint8_t(v[3]>>2);out[written+9]=uint8_t(v[7]>>2);written+=10;
+    const size_t groups=length/10;
+    bool ok=false;
+    switch(width){
+        case 2:ok=wide_tiles<2>(in,out,values,k,groups);break;
+        case 3:ok=wide_tiles<3>(in,out,values,k,groups);break;
+        case 4:ok=wide_tiles<4>(in,out,values,k,groups);break;
+        case 5:ok=wide_tiles<5>(in,out,values,k,groups);break;
+        case 6:ok=wide_tiles<6>(in,out,values,k,groups);break;
+        case 7:ok=wide_tiles<7>(in,out,values,k,groups);break;
+        case 8:ok=wide_tiles<8>(in,out,values,k,groups);break;
+        case 9:ok=wide_tiles<9>(in,out,values,k,groups);break;
     }
+    if(!ok)return fail(env,"Invalid palette index");
+    pos=groups*width;written=groups*10;
     for(uint32_t j=(length/10)*8;j<count;j++){
         while(available<width){acc|=uint32_t(in[pos++])<<available;available+=8;}
         const uint32_t ix=acc&mask;acc>>=width;available-=width;

@@ -1,0 +1,35 @@
+name: Codec validation
+on:
+  push:
+    branches: [symbol10-one-bit-eco]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  software:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm test
+      - run: npx --yes node-gyp rebuild --directory native
+      - run: node -e "if(!require('./binary-palette.cjs').nativeEnabled)process.exit(1)"
+      - run: npm test
+      - run: node tools/bench-performance.cjs 0.2 3
+  hardware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y iverilog clang
+      - run: clang -x cl -cl-std=CL1.2 -fsyntax-only -DCHUNK_WORDS=16384 -DDESCRIPTOR_WORDS=5 -DHEADER_WORDS=16 -DSYMBOL_COUNT=1024 -DWORDS_PER_GROUP=1020 palette.cl
+      - run: iverilog -g2012 -s tb_s10_binary_stream -o /tmp/s10sim hardware/s10_binary_stream.v hardware/tb_s10_binary_stream.sv
+      - run: vvp /tmp/s10sim

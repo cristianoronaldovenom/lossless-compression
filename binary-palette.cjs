@@ -60,7 +60,7 @@ function expandBinaryInto(indices,destination,a,b){
     return expandBinary(indices,destination.length,a,b,destination);
 }
 function expandWideNative(indices,length,width,values){
-    if(typeof native?.expandPalette!=="function" || process.env.S10_DISABLE_WIDE_NATIVE==="1")return null;
+    if(typeof native?.expandPalette!=="function" || process.env.S10_ENABLE_WIDE_NATIVE!=="1" || process.env.S10_DISABLE_WIDE_NATIVE==="1")return null;
     return native.expandPalette(indices,length,width,values);
 }
 module.exports = { expandBinary, expandBinaryInto, expandWideNative, nativeEnabled: Boolean(native) };

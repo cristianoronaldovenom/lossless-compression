@@ -72,3 +72,5 @@ The optional native addon now handles widths 2..9 as well as binary indices.
 S10_DISABLE_WIDE_NATIVE=1 selects the previous JS path. No archive changes.
 Run node --test test/hybrid-native.test.cjs after rebuilding the addon.
 GPU throughput and hardware utilization need real hardware measurement.
+
+Wide native tiles now specialize each index width 2..9 at compile time. Enable with `S10_ENABLE_WIDE_NATIVE=1` after paired testing; the existing JS wide path remains default until speed is established. The CI workflow tests CPU and native paths on Windows/Linux, OpenCL syntax and the FPGA simulation; it does not benchmark physical accelerators.

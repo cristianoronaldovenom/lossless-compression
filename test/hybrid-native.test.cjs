@@ -17,7 +17,9 @@ test("GPU backing transferred once, CPU rows copied and corruption rejected",()=
 });
 test("wide palettes match reference across widths and tails",()=>{
  const dict=makeDictionary(42);
- for(const levels of [3,7,15,31,63,127,255,511])for(let tail=0;tail<20;tail++){
+ const enableBefore=process.env.S10_ENABLE_WIDE_NATIVE;
+ process.env.S10_ENABLE_WIDE_NATIVE="1";
+ try { for(const levels of [3,7,15,31,63,127,255,511])for(let tail=0;tail<20;tail++){
   const raw=new Uint8Array(65536-tail);let seed=42,acc=0,bits=0,pos=0;
   while(pos<raw.length){
    seed=(Math.imul(seed,1664525)+1013904223)>>>0;
@@ -31,5 +33,23 @@ test("wide palettes match reference across widths and tails",()=>{
   try{process.env.S10_DISABLE_WIDE_NATIVE="1";assert.deepEqual(Buffer.from(fast),Buffer.from(decodePalette(packed,raw.length,dict)));}
   finally{if(before===undefined)delete process.env.S10_DISABLE_WIDE_NATIVE;else process.env.S10_DISABLE_WIDE_NATIVE=before;}
   assert.deepEqual(Buffer.from(fast),Buffer.from(raw));
+ } } finally {if(enableBefore===undefined)delete process.env.S10_ENABLE_WIDE_NATIVE;else process.env.S10_ENABLE_WIDE_NATIVE=enableBefore;}
+});
+
+test("worker ownership transfer with real SHA-256 and ordered output",async()=>{
+ const {runOrdered}=require("../codec-worker.cjs");
+ const jobs=[];
+ for(let i=0;i<12;i++){
+  const raw=Uint8Array.from({length:4096},(_,j)=>(i+j)&255);
+  const index=Buffer.alloc(32);digest(raw).copy(index,16,0,16);
+  const blocks=[raw];blocks.deviceBuffer=raw;
+  jobs.push(makeVerifyJob(blocks,index,0,32,true));
  }
+ let n=0;
+ for await(const result of runOrdered(jobs,{verifyDecoded:true},3)){
+  assert.equal(result.rows[0][0],n++);assert.equal(result.rows[0].length,4096);
+ }
+ assert.equal(n,12);
+ const raw=Uint8Array.of(1,2,3),index=Buffer.alloc(32),blocks=[raw];
+ await assert.rejects(async()=>{for await(const ignored of runOrdered([makeVerifyJob(blocks,index,0,32,false)],{verifyDecoded:true},2)){}},/checksum mismatch/);
 });
