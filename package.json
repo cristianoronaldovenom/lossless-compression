@@ -9,7 +9,9 @@
   "scripts": {
     "test": "node symbol10.cjs self-test && node --test test/*.test.cjs",
     "test:gpu": "node symbol10.cjs self-test --gpu",
-    "bench:core": "node tools/bench-performance.cjs 1 5"
+    "bench:core": "node tools/bench-performance.cjs 1 5",
+    "doctor": "node symbol10.cjs doctor",
+    "build:native": "npx --yes node-gyp rebuild --directory native"
   },
   "optionalDependencies": {
     "koffi": "3.3.8"

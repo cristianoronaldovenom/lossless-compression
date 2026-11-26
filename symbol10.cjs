@@ -262,8 +262,8 @@ function prepareBatch(fd, archive, first, last, gpu, scratch, flush = false) {
         const payload = bytes.subarray(offset, offset + archive.index.readUInt32LE(entry + 8));
         const rawLength = Math.min(CHUNK_BYTES, archive.rawSize - block * CHUNK_BYTES);
         const mode = archive.index[entry + 12];
-        if (gpu && mode === PALETTE) {
-            const layout = paletteLayout(payload, rawLength);
+        const layout = gpu && mode === PALETTE ? paletteLayout(payload, rawLength) : undefined;
+        if (layout && (!gpu.supportsWidth || gpu.supportsWidth(layout.width))) {
             descriptors.set([offset + 2, offset + layout.paletteEnd, layout.paletteLength, layout.width, rawLength], deviceBlocks.length * 5);
             deviceBlocks.push({ block, rawLength, payload });
             paletteBytes += payload.length;
@@ -326,7 +326,8 @@ function decodeBatch(fd, archive, first, last, gpu, scratch) {
     return verifyBatch(archive, first, prepareBatch(fd, archive, first, last, gpu, scratch)());
 }
 
-function openArchive(source, { gpu: useGpu = false, gpuPipeline = false } = {}) {
+function openArchive(source, { gpu: useGpu = false, gpuPipeline = false, fpgaDriver } = {}) {
+    if(fpgaDriver!==undefined && useGpu!==false)throw Error("Choose either GPU or FPGA");
     if (![false, true, "auto"].includes(useGpu) && (!Number.isSafeInteger(useGpu) || useGpu < 0)) {
         throw TypeError("GPU selection must be false, true, auto, or an adapter index");
     }
@@ -335,7 +336,8 @@ function openArchive(source, { gpu: useGpu = false, gpuPipeline = false } = {}) 
     try {
         archive = inspectArchive(fd);
         archive.dictionary = makeDictionary(archive.seed);
-        if (useGpu !== false && useGpu !== "auto") {
+        if (fpgaDriver!==undefined) gpu=require("./fpga-backend.cjs").createFpga(archive.dictionary.inverse,fpgaDriver);
+        else if (useGpu !== false && useGpu !== "auto") {
             gpu = require("./opencl.cjs").createGpu(archive.dictionary.inverse, useGpu === true ? undefined : useGpu);
         }
     } catch (error) {
@@ -886,6 +888,10 @@ const usage = "node symbol10.cjs pack <file|-> <archive> [--fast-decode] [--work
     "node symbol10.cjs bench-decode <archive> [--gpu|--gpu=auto|--gpu=INDEX] [--gpu-pipeline] [--seconds=N]\n" +
     "node symbol10.cjs bench <file>\n" +
     "node symbol10.cjs devices\n" +
+    "node symbol10.cjs doctor\n" +
+    "node symbol10.cjs autotune <archive>\n" +
+    "node symbol10.cjs adaptive-unpack <archive> <file>\n" +
+    "node symbol10.cjs fpga-unpack <archive> <file> <trusted-driver-module|simulator>\n" +
     "node symbol10.cjs firmware <emulator|serial> <archive> <file|-> <executable|port>\n" +
     "node symbol10.cjs v2 <pack|verify|unpack|read|info> ...\n" +
     "node symbol10.cjs v3 <pack|unpack|read|verify|repair> ...\n" +
@@ -898,6 +904,18 @@ const commandUsage = new Map(usage.split("\n").map(line => [line.split(" ")[2], 
 async function main(args) {
     const [command, ...values] = args;
     if (!command || command === "--help") return console.log(usage);
+    if (command === "doctor" && values.length===0) return require("./platform.cjs").doctor();
+    if (command === "autotune" && values.length===1)
+        return require("./platform.cjs").autotune(values[0],openArchive);
+    if (command === "adaptive-unpack" && values.length===2) {
+        const result=require("./platform.cjs").autotune(values[0],openArchive);
+        return extract(values[0],values[1],0,undefined,result.selected,1,result.selected!==false);
+    }
+    if (command === "fpga-unpack" && values.length===3) {
+        const reader=openArchive(values[0],{fpgaDriver:values[2]});
+        try{await publishFile(values[1],fd=>reader.writeTo(fd));}finally{reader.close();}
+        return;
+    }
     if (command === "v2") return require("./archive-v2.cjs").main(values);
     if (command === "v3") return require("./archive-v3.cjs").main(values);
     if (command === "bitline") return require("./language/bitline.cjs").main(values);

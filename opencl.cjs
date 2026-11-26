@@ -48,8 +48,11 @@ function loadApi() {
     };
     const locate = loaders[process.platform];
     if (!locate) throw Error("OpenCL is unavailable on " + process.platform);
-    const loader = locate();
-    const lib = ffi.load(loader);
+    const explicit=process.env.S10_OPENCL_LIBRARY;
+    const names=explicit?[explicit]:[locate(),...(process.platform==="linux"?["libOpenCL.so"]:[])];
+    let lib,lastError;
+    for(const name of names){try{lib=ffi.load(name);break;}catch(error){lastError=error;}}
+    if(!lib)throw Error("OpenCL loader unavailable: "+lastError?.message);
     const bind = signature => lib.func(signature);
     return {
         platforms: bind("int clGetPlatformIDs(uint32_t, void *, void *)"),
@@ -125,11 +128,15 @@ function enumerate(api) {
                 adapter.version = canQueryCompiler ? text(0x103d) : runtime;
                 adapter.unified = canQueryCompiler && Boolean(uint(0x1035));
                 adapter.computeUnits = uint(0x1002);
+                adapter.clockMHz = uint(0x100c);
+                adapter.globalMemoryBytes = Number(deviceInfo(api,id,0x101f,8).readBigUInt64LE());
+                adapter.maxAllocationBytes = Number(deviceInfo(api,id,0x1010,8).readBigUInt64LE());
+                adapter.driver = text(0x102d);
                 const [, major, minor] = /^OpenCL C (\d+)\.(\d+)/.exec(adapter.version) ?? [];
                 const compiler = Number(major) >= 2 || (Number(major) === 1 && Number(minor) >= 2);
                 adapter.dimensions = uint(0x1003);
                 const localMemory = deviceInfo(api, id, 0x1023, 8).readBigUInt64LE();
-                adapter.supported = compiler && adapter.dimensions >= 2 && localMemory >= BigInt(SYMBOLS * 2) &&
+                adapter.supported = compiler && adapter.dimensions >= 2 && localMemory >= BigInt(SYMBOLS * 2 + 128) &&
                     Boolean(uint(0x1026) && uint(0x1027) && uint(0x1028));
             } catch (error) {
                 adapter.name ??= "OpenCL adapter " + adapter.index;
