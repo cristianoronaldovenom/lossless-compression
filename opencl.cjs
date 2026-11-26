@@ -318,7 +318,7 @@ class GpuDecoder {
         try {
             const lastLength = descriptors[descriptors.length - 1];
             const resultLength = (count - 1) * CHUNK + lastLength;
-            const result = Buffer.allocUnsafe(OUTPUT_HEADER_BYTES + Math.ceil(resultLength / 4) * 4);
+            const result = Buffer.allocUnsafeSlow(OUTPUT_HEADER_BYTES + Math.ceil(resultLength / 4) * 4);
             this.read(slot.queue, slot.output, result);
             if (result.readUInt32LE()) throw Error("Invalid GPU palette index, symbol, or symbol padding");
             const stamp = key => {

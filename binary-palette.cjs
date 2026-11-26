@@ -59,4 +59,8 @@ function expandBinaryInto(indices,destination,a,b){
     if(!(destination instanceof Uint8Array))throw TypeError("Expected destination Uint8Array");
     return expandBinary(indices,destination.length,a,b,destination);
 }
-module.exports = { expandBinary, expandBinaryInto, nativeEnabled: Boolean(native) };
+function expandWideNative(indices,length,width,values){
+    if(typeof native?.expandPalette!=="function" || process.env.S10_DISABLE_WIDE_NATIVE==="1")return null;
+    return native.expandPalette(indices,length,width,values);
+}
+module.exports = { expandBinary, expandBinaryInto, expandWideNative, nativeEnabled: Boolean(native) };

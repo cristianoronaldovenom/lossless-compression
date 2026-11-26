@@ -58,3 +58,17 @@ validation checks dictionary consistency and 64 KiB bounds; reset and discard
 on error. No PCIe driver or synthesis is supplied. Run
 node --test test/performance-core.test.cjs and node tools/bench-performance.cjs 1 5
 for paired memory benchmarks. These are not full restore benchmarks.
+
+## Hybrid verified decoding and wide native palettes
+
+Set S10_VERIFY_WORKERS=eco (or 2..16) with --gpu or --gpu=auto to use the
+experimental parallel verifier path. GPU readback uses an owned ArrayBuffer
+transferred once to a worker, including all device rows as views; CPU-only
+rows are copied before the scratch is reused. Workers check existing SHA-256
+truncations before ordered publication. This path uses one GPU submission
+at a time while verifier workers run, and supersedes --gpu-pipeline when
+enabled. Bench-decode includes GPU/worker initialization in this mode.
+The optional native addon now handles widths 2..9 as well as binary indices.
+S10_DISABLE_WIDE_NATIVE=1 selects the previous JS path. No archive changes.
+Run node --test test/hybrid-native.test.cjs after rebuilding the addon.
+GPU throughput and hardware utilization need real hardware measurement.

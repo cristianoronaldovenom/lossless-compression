@@ -1,7 +1,7 @@
 "use strict";
 
 const zlib = require("node:zlib");
-const { expandBinary } = require("./binary-palette.cjs");
+const { expandBinary, expandWideNative } = require("./binary-palette.cjs");
 const { encodeBinary } = require("./binary-encode.cjs");
 
 const SYMBOL_COUNT = 1024;
@@ -132,6 +132,10 @@ function decodePalette(payload, rawLength, dictionary) {
             value, (value >>> 8) | (value << 2), (value >>> 6) | (value << 4),
             (value >>> 4) | (value << 6), value >>> 2
         ]));
+    }
+    if(width>=2){
+        const fast=expandWideNative(payload.subarray(paletteEnd),rawLength,width,values.subarray(0,paletteLength));
+        if(fast)return fast;
     }
     const output = new Uint8Array(rawLength);
     const target = new DataView(output.buffer);

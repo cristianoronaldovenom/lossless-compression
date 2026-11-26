@@ -80,11 +80,59 @@ napi_value expand(napi_env env, napi_callback_info info) {
     if (length % 10) std::memcpy(out + 10*full, cache.entries[input[full]].data(), length % 10);
     return result;
 }
+napi_value expand_palette(napi_env env, napi_callback_info info) {
+    size_t argc=4; napi_value args[4],backing,result;
+    napi_typedarray_type type; size_t n,off,k; void* source=nullptr; void* palette=nullptr;
+    uint32_t length,width;
+    if(napi_get_cb_info(env,info,&argc,args,nullptr,nullptr)!=napi_ok||argc!=4||
+       napi_get_typedarray_info(env,args[0],&type,&n,&source,&backing,&off)!=napi_ok||type!=napi_uint8_array||
+       napi_get_value_uint32(env,args[1],&length)!=napi_ok||
+       napi_get_value_uint32(env,args[2],&width)!=napi_ok||
+       napi_get_typedarray_info(env,args[3],&type,&k,&palette,&backing,&off)!=napi_ok||type!=napi_uint16_array||
+       length<1||length>65536||width<2||width>9||k<3||k>(1u<<width)||k<=(1u<<(width-1)))
+        return fail(env,"Invalid native palette");
+    const uint32_t count=(length*8+9)/10, bits=count*width;
+    if(n!=(bits+7)/8||!source||!palette)return fail(env,"Invalid native palette length");
+    const auto* in=static_cast<const uint8_t*>(source);
+    const auto* values=static_cast<const uint16_t*>(palette);
+    if((bits&7)&&(in[n-1]>>(bits&7)))return fail(env,"Invalid index padding");
+    for(size_t i=0;i<k;i++)if(values[i]>1023)return fail(env,"Invalid palette value");
+    void* dest=nullptr;
+    if(napi_create_buffer(env,length,&dest,&result)!=napi_ok)return fail(env,"Cannot allocate output");
+    auto* out=static_cast<uint8_t*>(dest);
+    uint32_t acc=0,available=0,output=0,used=0; size_t pos=0,written=0;
+    const uint32_t mask=(1u<<width)-1;
+    // Accumulate exactly eight indices and emit ten bytes in grouped stores.
+    for(uint32_t group=0;group<length/10;group++){
+        uint32_t v[8];
+        for(unsigned j=0;j<8;j++){
+            while(available<width){acc|=uint32_t(in[pos++])<<available;available+=8;}
+            const uint32_t ix=acc&mask;acc>>=width;available-=width;
+            if(ix>=k)return fail(env,"Invalid palette index");v[j]=values[ix];
+        }
+        const uint32_t a=v[0]|v[1]<<10|v[2]<<20|v[3]<<30;
+        const uint32_t b=v[4]|v[5]<<10|v[6]<<20|v[7]<<30;
+        // Explicit LE stores preserve format on big-endian hosts.
+        for(unsigned j=0;j<4;j++){out[written+j]=uint8_t(a>>(8*j));out[written+5+j]=uint8_t(b>>(8*j));}
+        out[written+4]=uint8_t(v[3]>>2);out[written+9]=uint8_t(v[7]>>2);written+=10;
+    }
+    for(uint32_t j=(length/10)*8;j<count;j++){
+        while(available<width){acc|=uint32_t(in[pos++])<<available;available+=8;}
+        const uint32_t ix=acc&mask;acc>>=width;available-=width;
+        if(ix>=k)return fail(env,"Invalid palette index");
+        output|=uint32_t(values[ix])<<used;used+=10;
+        while(used>=8&&written<length){out[written++]=uint8_t(output);output>>=8;used-=8;}
+    }
+    if(written!=length||output)return fail(env,"Invalid symbol padding");
+    return result;
+}
 napi_value init(napi_env env, napi_value exports) {
     napi_value fn;
     if (napi_create_function(env, "expand", NAPI_AUTO_LENGTH, expand, nullptr, &fn) != napi_ok ||
         napi_set_named_property(env, exports, "expand", fn) != napi_ok ||
         napi_set_named_property(env, exports, "expandInto", fn) != napi_ok) return fail(env, "Cannot initialize addon");
+    if(napi_create_function(env,"expandPalette",NAPI_AUTO_LENGTH,expand_palette,nullptr,&fn)!=napi_ok||
+       napi_set_named_property(env,exports,"expandPalette",fn)!=napi_ok)return fail(env,"Cannot initialize palette addon");
     return exports;
 }
 }

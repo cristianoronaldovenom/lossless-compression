@@ -60,7 +60,15 @@ async function* runOrdered(jobs, options, concurrency, createWorker = createCode
     }
 }
 
-if (!isMainThread && require.main === module && workerData.v3) {
+if (!isMainThread && require.main === module && workerData.verifyDecoded) {
+    const {verifyDecoded}=require("./verify-decoded.cjs");
+    parentPort.on("message",job=>{
+        try {
+            const result=verifyDecoded(job,digest);
+            parentPort.postMessage(result,result.rows?[...new Set(result.rows.map(row=>row.buffer))]:[]);
+        } catch(error) { parentPort.postMessage({error:error.message}); }
+    });
+} else if (!isMainThread && require.main === module && workerData.v3) {
     const { encodeGroup, decodeGroup } = require("./archive-v3-group.cjs");
     const handle = workerData.v3 === "pack" ? encodeGroup : decodeGroup;
     parentPort.on("message", job => {
