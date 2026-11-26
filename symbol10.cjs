@@ -254,6 +254,7 @@ function prepareBatch(fd, archive, first, last, gpu, scratch, flush = false) {
     const descriptors = gpu ? new Uint32Array((last - first) * 5) : undefined;
     const blocks = [];
     const deviceBlocks = [];
+    const cpuBlocks = [];
     let paletteBytes = 0;
     for (let block = first; block < last; block++) {
         const entry = block * ENTRY_BYTES;
@@ -267,7 +268,8 @@ function prepareBatch(fd, archive, first, last, gpu, scratch, flush = false) {
             deviceBlocks.push({ block, rawLength, payload });
             paletteBytes += payload.length;
         } else {
-            blocks[block - first] = decodeBlock(mode, payload, rawLength, archive.dictionary);
+            if (gpu) cpuBlocks.push({block,mode,payload,rawLength});
+            else blocks[block - first] = decodeBlock(mode, payload, rawLength, archive.dictionary);
         }
     }
     let ready;
@@ -288,11 +290,15 @@ function prepareBatch(fd, archive, first, last, gpu, scratch, flush = false) {
             input.fill(0, offset);
         }
         const jobs = descriptors.subarray(0, deviceBlocks.length * 5);
-        if (flush) {
-            gpu.submit(input, jobs, deviceBlocks.length);
-            gpu.flush();
-        } else ready = gpu.decode(input, jobs, deviceBlocks.length);
+        gpu.submit(input, jobs, deviceBlocks.length);
+        gpu.flush();
     }
+    // CPU-only codecs execute while the GPU kernel is running.
+    try {
+        for (const {block,mode,payload,rawLength} of cpuBlocks)
+            blocks[block-first] = decodeBlock(mode,payload,rawLength,archive.dictionary);
+    } catch(error) { gpu?.discard(); throw error; }
+    if (deviceBlocks.length && !flush) ready = gpu.finish();
     return () => {
         if (deviceBlocks.length) {
             const decoded = ready ?? gpu.finish();
@@ -339,7 +345,7 @@ function openArchive(source, { gpu: useGpu = false, gpuPipeline = false } = {}) 
     let fallback;
     let failedGpu;
     const scratch = { bytes: Buffer.alloc(0) };
-    const pipelineScratch = [{ bytes: Buffer.alloc(0) }, { bytes: Buffer.alloc(0) }];
+    const pipelineScratch = Array.from({length:3}, () => ({bytes:Buffer.alloc(0)}));
     function disableGpu(error) {
         fallback = error.message;
         failedGpu = { gpuBytes: gpu.decodedBytes || 0, profiledBytes: gpu.profiledBytes || 0,
@@ -379,22 +385,14 @@ function openArchive(source, { gpu: useGpu = false, gpuPipeline = false } = {}) 
         // the previous kernel and readback. Scratch stays owned by its batch.
         if (gpuPipeline && reuse && gpu && useAccelerator) {
             let cursor = startBlock;
-            const submit = (first, slot) => {
-                const last = Math.min(first + gpu.batchBlocks, limit);
-                const collect = prepareBatch(fd, archive, first, last, gpu, pipelineScratch[slot], true);
-                return { first, last, collect };
-            };
             try {
-                while (cursor < limit) {
-                    const first = submit(cursor, 0);
-                    const next = gpu.pipelineSlots > 1 && first.last < limit ? submit(first.last, 1) : undefined;
-                    deliver(first.first, verifyBatch(archive, first.first, first.collect()));
-                    cursor = first.last;
-                    if (next) {
-                        deliver(next.first, verifyBatch(archive, next.first, next.collect()));
-                        cursor = next.last;
-                    }
-                }
+                require("./ordered-pipeline.cjs").runPipeline({
+                    start:startBlock,end:limit,batchSize:gpu.batchBlocks,slots:gpu.pipelineSlots,
+                    submit:(first,last,slot)=>prepareBatch(fd,archive,first,last,gpu,pipelineScratch[slot],true),
+                    collect:finish=>finish(),
+                    deliver:(first,blocks)=>deliver(first,verifyBatch(archive,first,blocks)),
+                    onProgress:last=>{cursor=last;}
+                });
             } catch (error) {
                 if (!automatic || !(error instanceof require("./opencl.cjs").OpenClError)) throw error;
                 disableGpu(error);
@@ -561,8 +559,8 @@ function benchmarkDecode(source, useGpu, minimumSeconds = 0, gpuPipeline = false
             const profiled = stats.profiledBytes - before.profiledBytes;
             if (ns > 0 && profiled > 0) {
                 console.log("Palette kernel only: " + (profiled / ns).toFixed(3) + " GB/s");
-                if (profiled === gpuBytes) console.log("Profiled kernel time / verified wall time: " +
-                    (ns / (seconds * 1e7)).toFixed(2) + "% (not GPU utilization)");
+                if (profiled === gpuBytes) console.log("Summed kernel time / verified wall time: " +
+                    (ns / (seconds * 1e7)).toFixed(2) + "% (overlap can exceed 100%; not GPU utilization)");
             }
         }
     } finally {

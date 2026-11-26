@@ -12,6 +12,13 @@ const WORDS_PER_GROUP = 1020;
 const MAX_BATCH_BLOCKS = 128;
 const SHARED_MEMORY_BATCH_BLOCKS = 32;
 const ZERO = Buffer.alloc(4);
+function requestedBatch(max) {
+    const raw=process.env.S10_GPU_BATCH_BLOCKS;
+    if(raw===undefined)return max;
+    const value=Number(raw);
+    if(!Number.isInteger(value)||value<1||value>128)throw Error("S10_GPU_BATCH_BLOCKS must be 1..128");
+    return Math.min(max,value);
+}
 let kernelSource;
 
 class OpenClError extends Error {}
@@ -218,8 +225,8 @@ class GpuDecoder {
             this.groupSize = preferred > 0 && preferred <= cap ? Math.floor(cap / preferred) * preferred : cap;
             this.localSize = sizeArray(this.groupSize, 1);
             const allocation = Number(deviceInfo(api, device, 0x1010, 8).readBigUInt64LE());
-            this.batchBlocks = Math.min(adapter.unified ? SHARED_MEMORY_BATCH_BLOCKS : MAX_BATCH_BLOCKS,
-                Math.floor((allocation - OUTPUT_HEADER_BYTES) / CHUNK));
+            this.batchBlocks = requestedBatch(Math.min(adapter.unified ? SHARED_MEMORY_BATCH_BLOCKS : MAX_BATCH_BLOCKS,
+                Math.floor((allocation - OUTPUT_HEADER_BYTES) / CHUNK)));
             if (this.batchBlocks < 1) throw Error("GPU allocation limit is too small");
             const allocate = (flags, bytes) => own("MemObject", api.buffer, context, flags, bytes, null);
             const dictionary = allocate(4, inverse.byteLength);
@@ -293,11 +300,16 @@ class GpuDecoder {
         checked(this.api.run(slot.queue, slot.kernel, 2, null, globalSize, this.localSize,
             0, null, event), "Dispatch decode");
         slot.busy = true;
-        this.pending.push({ slot, handle: event.readBigUInt64LE(), descriptors, count, decodedBytes });
+        this.pending.push({ slot, handle: event.readBigUInt64LE(), descriptors, count, decodedBytes, flushed:false });
     }
 
     flush() {
-        for (const {slot} of this.pending) checked(this.api.flush(slot.queue), "Flush decode queue");
+        for (const job of this.pending) {
+            if (!job.flushed) {
+                checked(this.api.flush(job.slot.queue), "Flush decode queue");
+                job.flushed=true;
+            }
+        }
     }
 
     finish() {

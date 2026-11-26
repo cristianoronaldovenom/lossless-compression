@@ -24,7 +24,7 @@ function prepare(a, b) {
     }
     cachedKey = key;
 }
-function expandBinary(indices, length, a, b) {
+function expandBinary(indices, length, a, b, destination) {
     if (!(indices instanceof Uint8Array) || !Number.isInteger(length) || length < 1 || length > 65536 ||
         !Number.isInteger(a) || !Number.isInteger(b) || a < 0 || a > 1023 || b < 0 || b > 1023 || a === b)
         throw Error("Invalid binary palette");
@@ -33,10 +33,14 @@ function expandBinary(indices, length, a, b) {
     if ((count & 7) && indices[indices.length - 1] >>> (count & 7)) throw Error("Invalid index padding");
     const last = (indices[(count - 1) >>> 3] >>> ((count - 1) & 7)) & 1 ? b : a;
     if (last >>> (length * 8 - 10 * (count - 1))) throw Error("Invalid symbol padding");
-    if (native) return native.expand(indices, length, a, b);
+    if(destination!==undefined && (!(destination instanceof Uint8Array)||destination.length!==length ||
+        (destination.buffer===indices.buffer && destination.byteOffset<indices.byteOffset+indices.byteLength &&
+         indices.byteOffset<destination.byteOffset+destination.byteLength)))throw Error("Invalid or overlapping output");
+    if (native && destination===undefined) return native.expand(indices, length, a, b);
+    if (native && typeof native.expandInto==="function") return native.expandInto(indices,length,a,b,destination);
     prepare(a, b);
-    const output = new Uint8Array(length);
-    const view = new DataView(output.buffer);
+    const output = destination ?? new Uint8Array(length);
+    const view = new DataView(output.buffer,output.byteOffset,output.byteLength);
     const full = Math.floor(length / 10);
     for (let i = 0, out = 0; i < full; i++, out += 10) {
         const t = indices[i] * 3;
@@ -51,4 +55,8 @@ function expandBinary(indices, length, a, b) {
     }
     return output;
 }
-module.exports = { expandBinary, nativeEnabled: Boolean(native) };
+function expandBinaryInto(indices,destination,a,b){
+    if(!(destination instanceof Uint8Array))throw TypeError("Expected destination Uint8Array");
+    return expandBinary(indices,destination.length,a,b,destination);
+}
+module.exports = { expandBinary, expandBinaryInto, nativeEnabled: Boolean(native) };

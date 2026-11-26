@@ -1,7 +1,7 @@
 "use strict";
 
 const { Worker, isMainThread, parentPort, workerData } = require("node:worker_threads");
-const { createHash } = require("node:crypto");
+const { digest } = require("./archive-format.cjs");
 
 function createCodecWorker(options) {
     const worker = new Worker(__filename, { workerData: options });
@@ -76,9 +76,10 @@ if (!isMainThread && require.main === module && workerData.v3) {
     const dictionary = makeDictionary(workerData.seed);
     function encode(raw) {
         const { mode, bytes } = encodeBlock(raw, dictionary, workerData.fastDecode);
-        const checksum = createHash("sha256").update(raw).digest().subarray(0, 16);
+        const checksum = digest(raw).subarray(0, 16);
         // A zlib result may share an allocation. Transfer only the selected payload.
-        const payload = bytes.buffer === raw.buffer ? raw : Uint8Array.from(bytes);
+        const payload = bytes.buffer === raw.buffer ? raw :
+            (!Buffer.isBuffer(bytes) && bytes.byteOffset===0 && bytes.byteLength===bytes.buffer.byteLength ? bytes : Uint8Array.from(bytes));
         parentPort.postMessage({ rawLength: raw.length, mode, bytes: payload, checksum }, [payload.buffer]);
     }
     function decode({ payload, blocks, start, end, restore, version }) {
@@ -86,7 +87,7 @@ if (!isMainThread && require.main === module && workerData.v3) {
         let written = 0;
         for (const { mode, offset, stored, rawLength, block, checksum, base } of blocks) {
             const raw = decodeBlock(mode, payload.subarray(offset, offset + stored), rawLength, dictionary);
-            const actual = createHash("sha256").update(raw).digest().subarray(0, 16);
+            const actual = digest(raw).subarray(0, 16);
             if (!actual.equals(checksum)) {
                 throw Error(version === 2 ? "v2 chunk checksum mismatch at byte " + base :
                     "Chunk checksum mismatch at block " + block);

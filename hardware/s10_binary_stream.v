@@ -24,6 +24,9 @@ module s10_binary_stream(
     reg [1151:0] buffer;
     reg [7:0] used;
     reg final_pending;
+    reg packet_open;
+    reg [9:0] packet_a,packet_b;
+    reg [16:0] packet_bytes;
     assign out_valid = (used >= 64) || (final_pending && used != 0);
     assign out_last = final_pending && used <= 64 && used != 0;
     assign out_data = buffer[511:0];
@@ -32,7 +35,7 @@ module s10_binary_stream(
     wire [7:0] after_pop = pop ? (used > 64 ? used-64 : 0) : used;
     wire [1151:0] shifted = pop ? (buffer >> 512) : buffer;
     wire accept = stage_valid && !final_pending && after_pop <= 64;
-    assign in_ready = !stage_valid || accept;
+    assign in_ready = !error && (!stage_valid || accept);
     wire take = in_valid && in_ready;
 
     // Before a final beat, occupancy is a multiple of 16. Final partial
@@ -61,7 +64,10 @@ module s10_binary_stream(
     wire [9:0] symbol_count = (valid_bits + 10'd9) / 10'd10;
     wire [9:0] last_valid = valid_bits - (symbol_count-1'b1)*10'd10;
     wire [9:0] last_symbol = in_indices[(symbol_count-1'b1)&10'd63] ? symbol1 : symbol0;
+    wire [17:0] total_bytes = {1'b0,packet_bytes} + in_bytes;
     wire bad = in_bytes == 0 || in_bytes > 80 || (!in_last && in_bytes != 80) ||
+               total_bytes > 18'd65536 || (!in_last && total_bytes >= 18'd65536) ||
+               (packet_open && (symbol0 != packet_a || symbol1 != packet_b)) ||
                symbol0 == symbol1 || (in_last &&
                ((symbol_count < 64 && (in_indices >> symbol_count) != 0) ||
                 (last_symbol >> last_valid) != 0));
@@ -69,6 +75,7 @@ module s10_binary_stream(
         if(reset) begin
             stage_valid<=0; stage_last<=0; stage_bytes<=0; stage_data<=0;
             buffer<=0; used<=0; final_pending<=0; error<=0;
+            packet_open<=0; packet_a<=0; packet_b<=0; packet_bytes<=0;
         end else begin
             if(pop) begin
                 buffer<=shifted; used<=after_pop;
@@ -80,7 +87,11 @@ module s10_binary_stream(
             end
             if(take) begin
                 if(bad) begin error<=1; stage_valid<=0; end
-                else begin stage_valid<=1; stage_data<=expanded; stage_bytes<=in_bytes; stage_last<=in_last; end
+                else begin
+                    stage_valid<=1; stage_data<=expanded; stage_bytes<=in_bytes; stage_last<=in_last;
+                    packet_a<=symbol0; packet_b<=symbol1;
+                    packet_open<=!in_last; packet_bytes<=in_last ? 17'd0 : total_bytes[16:0];
+                end
             end
         end
     end

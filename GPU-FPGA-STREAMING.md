@@ -41,3 +41,20 @@ Simulation: iverilog -g2012 -s tb_s10_binary_stream -o sim hardware/s10_binary_s
 then vvp sim. No physical FPGA synthesis or GPU execution has been done
 in this environment. Test the RTL in simulation and perform timing closure.
 CPU and GPU formats are unchanged; FPGA does not yet restore full archives.
+
+## Continuous pipeline and memory reuse
+
+The ordered pipeline retains two queued device jobs and a third host scratch
+buffer, refilling before verification while retaining completed input.
+CPU-only blocks run after GPU dispatch. Checksums remain mandatory.
+Set S10_GPU_BATCH_BLOCKS to 1..128 to tune batch size; integrated GPUs are
+capped at 32. Kernel time is summed, not busy wall time. The packed encoder
+uses one distinguishing bit and an exact 40-bit XOR table. Set
+S10_BINARY_REFERENCE=1 to compare the previous encoder. The in-memory
+expandBinaryInto API accepts a nonoverlapping preallocated Uint8Array; the
+optional native addon supports it and caches four palettes per thread.
+File restoration still uses the existing archive output API. FPGA packet
+validation checks dictionary consistency and 64 KiB bounds; reset and discard
+on error. No PCIe driver or synthesis is supplied. Run
+node --test test/performance-core.test.cjs and node tools/bench-performance.cjs 1 5
+for paired memory benchmarks. These are not full restore benchmarks.
