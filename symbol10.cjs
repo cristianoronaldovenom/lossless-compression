@@ -553,6 +553,7 @@ function benchmarkDecode(source, useGpu, minimumSeconds = 0, gpuPipeline = false
         console.log("Open and first verified read: " + (ready - init).toFixed(1) + " ms");
         const before = reader.counters();
         const start = performance.now();
+        const cpuStart = process.cpuUsage();
         let passes = 0;
         let seconds;
         do {
@@ -563,6 +564,10 @@ function benchmarkDecode(source, useGpu, minimumSeconds = 0, gpuPipeline = false
         const stats = reader.counters();
         console.log("Warm verified decode: " + (passes * reader.size / seconds / 1e9).toFixed(3) +
             " GB/s (" + passes + " passes, " + reader.size + " bytes each)");
+        const cpu = process.cpuUsage(cpuStart);
+        const logical = require("node:os").availableParallelism?.() ?? require("node:os").cpus().length;
+        const cores = (cpu.user + cpu.system) / 1e6 / seconds;
+        console.log("Process CPU: " + cores.toFixed(2) + " logical cores, " + (100 * cores / logical).toFixed(1) + "% of " + logical + " available logical CPUs");
         if (stats.fallback) console.log("CPU fallback: " + stats.fallback);
         if (stats.device) {
             const gpuBytes = stats.gpuBytes - before.gpuBytes;
@@ -797,7 +802,7 @@ function nonnegative(value) {
 }
 
 function workerCount(value) {
-    const workers = nonnegative(value);
+    const workers = value === "eco" ? Math.max(1, Math.min(16, Math.floor((require("node:os").availableParallelism?.() ?? require("node:os").cpus().length) / 4))) : nonnegative(value);
     if (workers < 1 || workers > 16) throw Error("Worker count must be between 1 and 16");
     return workers;
 }

@@ -3,6 +3,7 @@ __kernel void expand(__global const uchar *bytes, __global const uint *jobs,
                      __global const ushort *inverse, __global uint *out) {
     uint row = get_global_id(1);
     __global const uint *job = jobs + DESCRIPTOR_WORDS * row;
+    __local uint binaryLo[16], binaryHi[16];
     uint width = job[3], size = job[4], lane = get_local_id(0);
     uint lanes = get_local_size(0);
     uint count = (size * 8 + 9) / 10;
@@ -27,6 +28,44 @@ __kernel void expand(__global const uchar *bytes, __global const uint *jobs,
             uint skip = (word % 5) * 2;
             target[word] = (value >> skip) | (value << (10 - skip)) |
                 (value << (20 - skip)) | (value << (30 - skip));
+        }
+        return;
+    }
+
+    // One-bit indices: 16-entry lookup table. Each lane produces a full
+    // output word using a single packed-index load, with exact tail handling.
+    if (width == 1) {
+        uint off = job[0];
+        uint id0 = (uint)bytes[off] | ((uint)bytes[off+1] << 8);
+        uint id1 = (uint)bytes[off+2] | ((uint)bytes[off+3] << 8);
+        if (id0 >= SYMBOL_COUNT || id1 >= SYMBOL_COUNT || id0 == id1 || job[2] != 2) {
+            if (lane == 0) atomic_or(error, 1);
+            return;
+        }
+        uint a = inverse[id0], b = inverse[id1];
+        for (uint k = lane; k < 16; k += lanes) {
+            uint v0 = k & 1 ? b : a, v1 = k & 2 ? b : a;
+            uint v2 = k & 4 ? b : a, v3 = k & 8 ? b : a;
+            binaryLo[k] = v0 | (v1 << 10) | (v2 << 20) | (v3 << 30);
+            binaryHi[k] = v3 >> 2;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __global const uchar *idx = bytes + job[1];
+        for (uint word = first + lane; word < limit; word += lanes) {
+            uint symbol = word * 32 / 10, skip = (word % 5) * 2;
+            uint key = (as_uint(vload4(0, idx + (symbol >> 3))) >> (symbol & 7)) & 15;
+            uint low = binaryLo[key], high = binaryHi[key];
+            if (word + 1 == words) {
+                uint remaining = count - symbol;
+                uint last = (key >> (remaining - 1)) & 1 ? b : a;
+                uint valid = size * 8 - 10 * (count - 1);
+                if (last >> valid) atomic_or(error, 2);
+                if (remaining < 4) {
+                    uint bits = remaining * 10;
+                    if (bits < 32) { low &= (1u << bits) - 1; high = 0; }
+                }
+            }
+            target[word] = skip ? ((low >> skip) | (high << (32 - skip))) : low;
         }
         return;
     }

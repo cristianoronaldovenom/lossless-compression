@@ -1,6 +1,7 @@
 "use strict";
 
 const zlib = require("node:zlib");
+const { expandBinary } = require("./binary-palette.cjs");
 
 const SYMBOL_COUNT = 1024;
 const CHUNK_BYTES = 65536;
@@ -116,6 +117,9 @@ function decodePalette(payload, rawLength, dictionary) {
             value, (value >>> 8) | (value << 2), (value >>> 6) | (value << 4),
             (value >>> 4) | (value << 6), value >>> 2
         ]));
+    }
+    if (width === 1 && process.env.S10_DISABLE_BINARY_FAST !== "1") {
+        return expandBinary(payload.subarray(paletteEnd), rawLength, values[0], values[1]);
     }
     const output = new Uint8Array(rawLength);
     const target = new DataView(output.buffer);
