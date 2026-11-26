@@ -32,8 +32,9 @@ __kernel void expand(__global const uchar *bytes, __global const uint *jobs,
         return;
     }
 
-    // One-bit indices: 16-entry lookup table. Each lane produces a full
-    // output word using a single packed-index load, with exact tail handling.
+    // One work-item expands 16 symbols into five adjacent output words.
+    // Tile starts are multiples of five words. Four 40-bit LUT entries
+    // form exactly 160 bits; two compressed bytes are fetched only once.
     if (width == 1) {
         uint off = job[0];
         uint id0 = (uint)bytes[off] | ((uint)bytes[off+1] << 8);
@@ -51,21 +52,33 @@ __kernel void expand(__global const uchar *bytes, __global const uint *jobs,
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         __global const uchar *idx = bytes + job[1];
-        for (uint word = first + lane; word < limit; word += lanes) {
+        uint fullLimit = min(limit / 5, size / 20) * 5;
+        for (uint word = first + 5 * lane; word < fullLimit; word += 5 * lanes) {
+            uint q = (word / 5) * 2;
+            uint x = idx[q], y = idx[q+1];
+            uint k0 = x & 15, k1 = x >> 4, k2 = y & 15, k3 = y >> 4;
+            uint l0 = binaryLo[k0], l1 = binaryLo[k1], l2 = binaryLo[k2], l3 = binaryLo[k3];
+            uint h0 = binaryHi[k0], h1 = binaryHi[k1], h2 = binaryHi[k2], h3 = binaryHi[k3];
+            vstore4((uint4)(l0, h0 | (l1 << 8),
+                (l1 >> 24) | (h1 << 8) | (l2 << 16),
+                (l2 >> 16) | (h2 << 16) | (l3 << 24)), 0, target + word);
+            target[word+4] = (l3 >> 8) | (h3 << 24);
+        }
+        // Partial unit: never interpret bits beyond the logical symbol count.
+        for (uint word = max(first, fullLimit) + lane; word < limit; word += lanes) {
             uint symbol = word * 32 / 10, skip = (word % 5) * 2;
-            uint key = (as_uint(vload4(0, idx + (symbol >> 3))) >> (symbol & 7)) & 15;
-            uint low = binaryLo[key], high = binaryHi[key];
+            uint remaining = min(4u, count-symbol);
+            uint q = symbol >> 3;
+            uint key = ((uint)idx[q] | ((uint)idx[q+1] << 8)) >> (symbol & 7);
+            uint v0 = key & 1 ? b : a;
+            uint v1 = remaining > 1 ? (key & 2 ? b : a) : 0;
+            uint v2 = remaining > 2 ? (key & 4 ? b : a) : 0;
+            uint v3 = remaining > 3 ? (key & 8 ? b : a) : 0;
             if (word + 1 == words) {
-                uint remaining = count - symbol;
-                uint last = (key >> (remaining - 1)) & 1 ? b : a;
-                uint valid = size * 8 - 10 * (count - 1);
-                if (last >> valid) atomic_or(error, 2);
-                if (remaining < 4) {
-                    uint bits = remaining * 10;
-                    if (bits < 32) { low &= (1u << bits) - 1; high = 0; }
-                }
+                uint last = remaining == 1 ? v0 : remaining == 2 ? v1 : remaining == 3 ? v2 : v3;
+                if (last >> (size * 8 - 10 * (count - 1))) atomic_or(error, 2);
             }
-            target[word] = skip ? ((low >> skip) | (high << (32 - skip))) : low;
+            target[word] = (v0 >> skip) | (v1 << (10-skip)) | (v2 << (20-skip)) | (v3 << (30-skip));
         }
         return;
     }

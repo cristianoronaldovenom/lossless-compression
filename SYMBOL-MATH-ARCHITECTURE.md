@@ -66,3 +66,7 @@ DMA, checksum, error signals and fallback for raw/general/DEFLATE.
 A preexisting ASIC with unrelated fixed logic cannot be programmed
 to do this. An FPGA can prototype the RTL. No synthesis, timing closure
 or silicon throughput has been verified.
+
+## Parallel streaming upgrade
+
+See [GPU and FPGA streaming architecture](GPU-FPGA-STREAMING.md) for the 16-symbol OpenCL tile, two-queue pipeline and 512-bit FPGA streaming core.

@@ -375,48 +375,32 @@ function openArchive(source, { gpu: useGpu = false, gpuPipeline = false } = {}) 
                 return raw.subarray(Math.max(0, start - base), end - base);
             }));
         }
-        // Only internal consumers that finish with each batch before returning may
-        // use the two reusable input buffers. Public visitors can retain references.
+        // Two distinct GPU queues allow the next upload/kernel to overlap
+        // the previous kernel and readback. Scratch stays owned by its batch.
         if (gpuPipeline && reuse && gpu && useAccelerator) {
-            // Reuse the device buffers only after readback. While the next kernel
-            // runs, the CPU verifies the previous batch's independent host buffers.
-            function submit(first, slot) {
-                const activeGpu = gpu;
-                const last = Math.min(first + (activeGpu?.batchBlocks ?? BATCH_BLOCKS), limit);
-                const retry = error => {
-                    if (!automatic || !activeGpu || !(error instanceof require("./opencl.cjs").OpenClError)) throw error;
-                    disableGpu(error);
-                    return prepareBatch(fd, archive, first, last)();
-                };
-                let finish;
-                try { finish = prepareBatch(fd, archive, first, last, activeGpu, pipelineScratch[slot], true); }
-                catch (error) {
-                    const blocks = retry(error);
-                    return { first, last, collect: () => blocks };
-                }
-                return { first, last, collect() {
-                    try { return finish(); }
-                    catch (error) { return retry(error); }
-                } };
-            }
+            let cursor = startBlock;
+            const submit = (first, slot) => {
+                const last = Math.min(first + gpu.batchBlocks, limit);
+                const collect = prepareBatch(fd, archive, first, last, gpu, pipelineScratch[slot], true);
+                return { first, last, collect };
+            };
             try {
-                let slot = 0, batch = submit(startBlock, slot);
-                while (batch) {
-                    const blocks = batch.collect();
-                    if (!gpu) {
-                        deliver(batch.first, verifyBatch(archive, batch.first, blocks));
-                        // Let the normal CPU loop finish with its reusable scratch.
-                        for (let first = batch.last; first < limit; first += BATCH_BLOCKS) {
-                            deliver(first, decodeBatch(fd, archive, first, Math.min(first + BATCH_BLOCKS, limit), undefined, scratch));
-                        }
-                        break;
+                while (cursor < limit) {
+                    const first = submit(cursor, 0);
+                    const next = gpu.pipelineSlots > 1 && first.last < limit ? submit(first.last, 1) : undefined;
+                    deliver(first.first, verifyBatch(archive, first.first, first.collect()));
+                    cursor = first.last;
+                    if (next) {
+                        deliver(next.first, verifyBatch(archive, next.first, next.collect()));
+                        cursor = next.last;
                     }
-                    let next, nextError;
-                    try { if (batch.last < limit) next = submit(batch.last, slot ^= 1); }
-                    catch (error) { nextError = error; }
-                    deliver(batch.first, verifyBatch(archive, batch.first, blocks));
-                    if (nextError) throw nextError;
-                    batch = next;
+                }
+            } catch (error) {
+                if (!automatic || !(error instanceof require("./opencl.cjs").OpenClError)) throw error;
+                disableGpu(error);
+                // Only retry batches not delivered; corrupt data still fails validation.
+                for (; cursor < limit; cursor += BATCH_BLOCKS) {
+                    deliver(cursor, decodeBatch(fd, archive, cursor, Math.min(cursor + BATCH_BLOCKS, limit), undefined, scratch));
                 }
             } finally { gpu?.discard(); }
             return;
@@ -658,6 +642,20 @@ function testGpu(dictionary, selection) {
                 }
                 batch.push({ raw, bytes: encodePalette(raw, dictionary) });
             }
+        }
+        // Exercise every 20-byte binary tile tail and both dictionary values.
+        for (let tail = 0; tail < 20; tail++) {
+            const raw = Buffer.alloc(CHUNK_BYTES - tail);
+            let bits = 0, available = 0, pos = 0;
+            const count = Math.ceil(raw.length * 8 / 10);
+            for (let j = 0; j < count; j++) {
+                bits |= (j === count-1 ? 0 : j & 1 ? 1023 : 0) << available;
+                available += 10;
+                while (available >= 8 && pos < raw.length) {
+                    raw[pos++] = bits & 255; bits >>>= 8; available -= 8;
+                }
+            }
+            batch.push({raw, bytes: encodePalette(raw, dictionary)});
         }
         // A nonzero one-entry palette exercises the repeating five-byte pattern.
         const repeated = Buffer.alloc(64000, 255);

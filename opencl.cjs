@@ -62,6 +62,7 @@ function loadApi() {
         fill: bind("int clEnqueueFillBuffer(uintptr_t, uintptr_t, const void *, size_t, size_t, size_t, uint32_t, void *, void *)"),
         run: bind("int clEnqueueNDRangeKernel(uintptr_t, uintptr_t, uint32_t, void *, void *, void *, uint32_t, void *, void *)"),
         flush: bind("int clFlush(uintptr_t)"),
+        finishQueue: bind("int clFinish(uintptr_t)"),
         profile: bind("int clGetEventProfilingInfo(uintptr_t, uint32_t, size_t, void *, void *)"),
         releaseEvent: bind("int clReleaseEvent(uintptr_t)"),
         release: name => bind("int clRelease" + name + "(uintptr_t)")
@@ -167,6 +168,8 @@ class GpuDecoder {
     constructor(inverse, api, adapter) {
         this.api = api;
         this.resources = [];
+        this.pending = [];
+        this.slots = [];
         this.kernelNs = 0;
         this.profiledBytes = 0;
         this.decodedBytes = 0;
@@ -183,7 +186,7 @@ class GpuDecoder {
             const deviceId = sizeArray(device);
             this.name = adapter.name;
             const context = own("Context", api.context, sizeArray(0x1084, adapter.platform, 0), 1, deviceId, null, null);
-            this.queue = own("CommandQueue", api.queue, context, device, 2);
+            const queue = own("CommandQueue", api.queue, context, device, 2);
             kernelSource ??= fs.readFileSync(path.join(__dirname, "palette.cl"), "utf8");
             const program = own("Program", api.program, context, 1, [kernelSource], null);
             const options = [
@@ -202,10 +205,10 @@ class GpuDecoder {
                 checked(api.buildInfo(program, device, 0x1183, log.length, log, null), "Read build log");
                 throw Error("OpenCL program build failed: " + log.toString());
             }
-            this.kernel = own("Kernel", api.kernel, program, "expand");
+            const kernel = own("Kernel", api.kernel, program, "expand");
             const kernelSize = key => {
                 const value = Buffer.alloc(8);
-                checked(api.kernelInfo(this.kernel, device, key, 8, value, null), "Read kernel work-group limits");
+                checked(api.kernelInfo(kernel, device, key, 8, value, null), "Read kernel work-group limits");
                 return Number(value.readBigUInt64LE());
             };
             const firstDimension = Number(deviceInfo(api, device, 0x1005, adapter.dimensions * 8).readBigUInt64LE());
@@ -219,30 +222,40 @@ class GpuDecoder {
                 Math.floor((allocation - OUTPUT_HEADER_BYTES) / CHUNK));
             if (this.batchBlocks < 1) throw Error("GPU allocation limit is too small");
             const allocate = (flags, bytes) => own("MemObject", api.buffer, context, flags, bytes, null);
-            this.input = allocate(4, CHUNK * this.batchBlocks + INPUT_GUARD_BYTES);
-            this.jobs = allocate(4, DESCRIPTOR_WORDS * 4 * this.batchBlocks);
             const dictionary = allocate(4, inverse.byteLength);
-            this.output = allocate(1, OUTPUT_HEADER_BYTES + CHUNK * this.batchBlocks);
-            [this.input, this.jobs, dictionary, this.output].forEach((buffer, index) => {
-                checked(api.arg(this.kernel, index, 8, sizeArray(buffer)), "Bind kernel argument");
-            });
-            this.write(dictionary, inverse);
+            this.pipelineSlots = process.env.S10_GPU_SLOTS === "1" ? 1 : 2;
+            for (let i = 0; i < this.pipelineSlots; i++) {
+                const slot = {
+                    queue: i === 0 ? queue : own("CommandQueue", api.queue, context, device, 2),
+                    kernel: i === 0 ? kernel : own("Kernel", api.kernel, program, "expand"),
+                    input: allocate(4, CHUNK * this.batchBlocks + INPUT_GUARD_BYTES),
+                    jobs: allocate(4, DESCRIPTOR_WORDS * 4 * this.batchBlocks),
+                    output: allocate(1, OUTPUT_HEADER_BYTES + CHUNK * this.batchBlocks),
+                    busy: false
+                };
+                [slot.input, slot.jobs, dictionary, slot.output].forEach((buffer, index) => {
+                    checked(api.arg(slot.kernel, index, 8, sizeArray(buffer)), "Bind kernel argument");
+                });
+                this.slots.push(slot);
+            }
+            this.write(queue, dictionary, inverse);
         } catch (error) {
             this.close();
             throw error;
         }
     }
 
-    write(handle, bytes) {
-        checked(this.api.write(this.queue, handle, 1, 0, bytes.byteLength, bytes, 0, null, null), "Upload");
+    write(queue, handle, bytes) {
+        checked(this.api.write(queue, handle, 1, 0, bytes.byteLength, bytes, 0, null, null), "Upload");
     }
 
-    read(handle, bytes) {
-        checked(this.api.read(this.queue, handle, 1, 0, bytes.byteLength, bytes, 0, null, null), "Download");
+    read(queue, handle, bytes) {
+        checked(this.api.read(queue, handle, 1, 0, bytes.byteLength, bytes, 0, null, null), "Download");
     }
 
     submit(payload, descriptors, count) {
-        if (this.pending) throw Error("GPU decoder already has a pending batch");
+        const slot = this.slots.find(item => !item.busy);
+        if (!slot) throw Error("GPU decoder has no free batch slot");
         if (!this.resources.length) throw Error("GPU decoder is closed");
         if (!(payload instanceof Uint8Array) || !(descriptors instanceof Uint32Array) ||
             !Number.isInteger(count) || count < 1 || count > this.batchBlocks ||
@@ -270,31 +283,31 @@ class GpuDecoder {
             decodedBytes += length;
             longestBlock = Math.max(longestBlock, length);
         }
-        this.write(this.input, payload);
-        this.write(this.jobs, descriptors);
-        checked(this.api.fill(this.queue, this.output, ZERO, ZERO.length, 0, OUTPUT_HEADER_BYTES, 0, null, null),
+        this.write(slot.queue, slot.input, payload);
+        this.write(slot.queue, slot.jobs, descriptors);
+        checked(this.api.fill(slot.queue, slot.output, ZERO, ZERO.length, 0, OUTPUT_HEADER_BYTES, 0, null, null),
             "Clear decode status");
         const event = Buffer.alloc(8);
         const groups = Math.ceil(longestBlock / (WORDS_PER_GROUP * 4));
         const globalSize = sizeArray(groups * this.groupSize, count);
-        checked(this.api.run(this.queue, this.kernel, 2, null, globalSize, this.localSize,
+        checked(this.api.run(slot.queue, slot.kernel, 2, null, globalSize, this.localSize,
             0, null, event), "Dispatch decode");
-        this.pending = { handle: event.readBigUInt64LE(), descriptors, count, decodedBytes };
+        slot.busy = true;
+        this.pending.push({ slot, handle: event.readBigUInt64LE(), descriptors, count, decodedBytes });
     }
 
     flush() {
-        checked(this.api.flush(this.queue), "Flush decode queue");
+        for (const {slot} of this.pending) checked(this.api.flush(slot.queue), "Flush decode queue");
     }
 
     finish() {
-        if (!this.pending) throw Error("GPU decoder has no pending batch");
-        const { handle, descriptors, count, decodedBytes } = this.pending;
-        this.pending = undefined;
+        if (!this.pending.length) throw Error("GPU decoder has no pending batch");
+        const { slot, handle, descriptors, count, decodedBytes } = this.pending.shift();
         try {
             const lastLength = descriptors[descriptors.length - 1];
             const resultLength = (count - 1) * CHUNK + lastLength;
             const result = Buffer.allocUnsafe(OUTPUT_HEADER_BYTES + Math.ceil(resultLength / 4) * 4);
-            this.read(this.output, result);
+            this.read(slot.queue, slot.output, result);
             if (result.readUInt32LE()) throw Error("Invalid GPU palette index, symbol, or symbol padding");
             const stamp = key => {
                 const value = Buffer.alloc(8);
@@ -316,6 +329,7 @@ class GpuDecoder {
             return result.subarray(OUTPUT_HEADER_BYTES, OUTPUT_HEADER_BYTES + resultLength);
         } finally {
             this.api.releaseEvent(handle);
+            slot.busy = false;
         }
     }
 
@@ -325,14 +339,19 @@ class GpuDecoder {
     }
 
     discard() {
-        if (!this.pending) return;
-        this.api.releaseEvent(this.pending.handle);
-        this.pending = undefined;
+        // Drain every queue, including a partially submitted batch, before reuse.
+        for (const slot of this.slots) this.api.finishQueue(slot.queue);
+        for (const {slot,handle} of this.pending) {
+            this.api.releaseEvent(handle);
+            slot.busy = false;
+        }
+        this.pending.length = 0;
     }
 
     close() {
         this.discard();
         while (this.resources.length) this.resources.pop()();
+        this.slots.length = 0;
     }
 }
 
