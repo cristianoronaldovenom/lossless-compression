@@ -80,7 +80,7 @@ if (!isMainThread && require.main === module && workerData.verifyDecoded) {
         }
     });
 } else if (!isMainThread && require.main === module) {
-    const { makeDictionary, encodeBlock, decodeBlock } = require("./block-codec.cjs");
+    const { makeDictionary, encodeBlock, decodeBlock, decodeBlockInto } = require("./block-codec.cjs");
     const dictionary = makeDictionary(workerData.seed);
     function encode(raw) {
         const { mode, bytes } = encodeBlock(raw, dictionary, workerData.fastDecode);
@@ -94,7 +94,10 @@ if (!isMainThread && require.main === module && workerData.verifyDecoded) {
         const output = restore ? new Uint8Array(end - start) : undefined;
         let written = 0;
         for (const { mode, offset, stored, rawLength, block, checksum, base } of blocks) {
-            const raw = decodeBlock(mode, payload.subarray(offset, offset + stored), rawLength, dictionary);
+            const packed=payload.subarray(offset,offset+stored);
+            const direct=output && start<=base && end>=base+rawLength;
+            const raw=direct?decodeBlockInto(mode,packed,output.subarray(written,written+rawLength),dictionary):
+                decodeBlock(mode,packed,rawLength,dictionary);
             const actual = digest(raw).subarray(0, 16);
             if (!actual.equals(checksum)) {
                 throw Error(version === 2 ? "v2 chunk checksum mismatch at byte " + base :
@@ -102,7 +105,7 @@ if (!isMainThread && require.main === module && workerData.verifyDecoded) {
             }
             if (output) {
                 const part = raw.subarray(Math.max(0, start - base), end - base);
-                output.set(part, written);
+                if(!direct)output.set(part, written);
                 written += part.length;
             }
         }

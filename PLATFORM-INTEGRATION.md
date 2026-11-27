@@ -83,3 +83,5 @@ fixture generation. File I/O and full archive metadata are excluded.
 Clock model divisor = reported MHz * worker count / measured GB/s. Recalibrate
 on each architecture; OS MHz is a snapshot, not a cycle counter. No Pi speed
 is claimed until it is run there. CI includes an ARM64 Linux runner, not a Pi.
+
+Full blocks restored by CPU workers now use caller-owned output slices directly for binary palette mode. Other codecs and partial ranges use the existing decode-and-copy fallback. Portable benchmark CPU usage is measured after the worker-ready barrier, including result delivery; it is process-wide, not a hard utilization cap.

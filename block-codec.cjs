@@ -1,7 +1,7 @@
 "use strict";
 
 const zlib = require("node:zlib");
-const { expandBinary, expandWideNative } = require("./binary-palette.cjs");
+const { expandBinary, expandBinaryInto, expandWideNative } = require("./binary-palette.cjs");
 const { encodeBinary } = require("./binary-encode.cjs");
 
 const SYMBOL_COUNT = 1024;
@@ -243,5 +243,26 @@ function decodeBlock(mode, payload, rawLength, dictionary) {
     return raw;
 }
 
-module.exports = { SYMBOL_COUNT, CHUNK_BYTES, RAW, PALETTE, DEFLATE,
+// Direct destination decode for complete blocks. Caller-owned memory must
+// not alias compressed input; partial ranges retain the original path.
+function decodeBlockInto(mode,payload,destination,dictionary){
+    if(!(destination instanceof Uint8Array)||!(payload instanceof Uint8Array)||
+       destination.length<1||destination.length>CHUNK_BYTES)
+        throw Error("Invalid decode destination");
+    if(destination.buffer===payload.buffer&&destination.byteOffset<payload.byteOffset+payload.byteLength&&
+       payload.byteOffset<destination.byteOffset+destination.byteLength)
+        throw Error("Overlapping decode destination");
+    if(mode===PALETTE && process.env.S10_DISABLE_BINARY_FAST!=="1"){
+        const layout=paletteLayout(payload,destination.length);
+        if(layout.width===1){
+            if(!(dictionary?.inverse instanceof Uint16Array)||dictionary.inverse.length!==SYMBOL_COUNT)
+                throw TypeError("Expected a Symbol10 inverse dictionary");
+            return expandBinaryInto(payload.subarray(layout.paletteEnd),destination,
+                dictionary.inverse[layout.view.getUint16(2,true)],dictionary.inverse[layout.view.getUint16(4,true)]);
+        }
+    }
+    destination.set(decodeBlock(mode,payload,destination.length,dictionary));
+    return destination;
+}
+module.exports = { SYMBOL_COUNT, CHUNK_BYTES, RAW, PALETTE, DEFLATE, decodeBlockInto,
     makeDictionary, encodeBlock, decodeBlock, paletteLayout, encodePalette, decodePalette };

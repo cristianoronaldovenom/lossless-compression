@@ -18,7 +18,11 @@ function fixture(profile,count,id){
   }else if(profile==="text"){
    const line=Buffer.from("Symbol10 portable test record "+i+" with repeated text and numbers "+next()+"\n");
    for(let j=0;j<L;j+=line.length)line.copy(raw,j,0,Math.min(line.length,L-j));
-  }else for(let j=0;j<L;j+=4)raw.writeUInt32LE(next(),j);
+  }else {
+   // Deterministic high-entropy benchmark fixture, not cryptographic RNG.
+   let x=next()||1;
+   for(let j=0;j<L;j+=4){x^=x<<13;x^=x>>>17;x^=x<<5;raw.writeUInt32LE(x>>>0,j);}
+  }
   const packed=encodeBlock(raw,dict,profile==="binary"),hash=sha(raw);
   assert.deepEqual(Buffer.from(decodeBlock(packed.mode,packed.bytes,L,dict)),raw);
   const dest=new Uint8Array(L);
@@ -57,13 +61,13 @@ function work({profile,mode,count,id,seconds,gate}){
 }
 async function trial(options,workers){
  const gate=new Int32Array(new SharedArrayBuffer(4)),pool=[];
- const startCpu=process.cpuUsage();let ready=0,begin;
+ let startCpu,ready=0,begin;
  try{
   const jobs=Array.from({length:workers},(_,id)=>new Promise((resolve,reject)=>{
    const w=new Worker(__filename,{workerData:{...options,id,gate}});pool.push(w);
    w.on("error",reject);w.on("exit",code=>{if(code!==0)reject(Error("Worker exited "+code));});
    w.on("message",r=>{
-    if(r.ready){if(++ready===workers){begin=performance.now();Atomics.store(gate,0,1);Atomics.notify(gate,0,workers);}}
+    if(r.ready){if(++ready===workers){startCpu=process.cpuUsage();begin=performance.now();Atomics.store(gate,0,1);Atomics.notify(gate,0,workers);}}
     else resolve(r);
    });
   }));
@@ -72,7 +76,8 @@ async function trial(options,workers){
   return {bytes:rows.reduce((a,b)=>a+b.bytes,0),seconds:wall,
    stored:rows.reduce((a,b)=>a+b.stored,0),original:rows.reduce((a,b)=>a+b.original,0),
    modes:rows.reduce((a,b)=>{for(const k of Object.keys(a))a[k]+=b.modes[k];return a;},{raw:0,palette:0,deflate:0}),
-   processCPUSeconds:(usage.user+usage.system)/1e6};
+   processCPUSeconds:(usage.user+usage.system)/1e6,
+   cpuPercent:100*(usage.user+usage.system)/1e6/wall/(os.availableParallelism?.()??os.cpus().length)};
  }finally{Atomics.store(gate,0,1);Atomics.notify(gate,0);await Promise.allSettled(pool.map(w=>w.terminate()));}
 }
 async function main(){
