@@ -41,3 +41,5 @@ stress test allocator and concurrent writes, emulate CXL device, validate
 crash consistency, measure P50/P99 latency and actual compression ratio on
 representative RAM/SSD traces. Retain uncompressed fallback and mandatory
 archive checksums.
+
+The registered line decoder now implements all six modes in RTL, with ready/valid backpressure. CI includes 60 CPU-generated valid line vectors and three invalid vectors, plus 1024 dual-port dictionary requests. These testbenches have not been run locally; timing, synthesis and full controller integration are unverified. Sparse decoding has variable routing and may require additional pipeline stages for timing closure.

@@ -36,6 +36,8 @@ jobs:
       - run: clang -x cl -cl-std=CL1.2 -fsyntax-only -DCHUNK_WORDS=16384 -DDESCRIPTOR_WORDS=5 -DHEADER_WORDS=16 -DSYMBOL_COUNT=1024 -DWORDS_PER_GROUP=1020 palette.cl
       - run: clang -x cl -cl-std=CL1.2 -fsyntax-only -DCHUNK_WORDS=16384 -DDESCRIPTOR_WORDS=5 -DHEADER_WORDS=16 -DSYMBOL_COUNT=1024 -DWORDS_PER_GROUP=1020 -DS10_COALESCED_BINARY=1 palette.cl
       - run: clang -x cl -cl-std=CL1.2 -fsyntax-only -DCHUNK_WORDS=16384 -DDESCRIPTOR_WORDS=5 -DHEADER_WORDS=16 -DSYMBOL_COUNT=1024 -DWORDS_PER_GROUP=1020 -DS10_COALESCED_BINARY=2 palette.cl
+      - run: iverilog -g2012 -s tb_s10_memory_line_decode -o /tmp/s10-line hardware/s10_memory_line_decode.v hardware/tb_s10_memory_line_decode.v && vvp /tmp/s10-line
+      - run: iverilog -g2012 -s tb_s10_dictionary_sram -o /tmp/s10-dict hardware/s10_dictionary_sram.v hardware/tb_s10_dictionary_sram.v && vvp /tmp/s10-dict
       - run: iverilog -g2012 -s tb_s10_binary_stream -o /tmp/s10sim hardware/s10_binary_stream.v hardware/tb_s10_binary_stream.sv
       - run: vvp /tmp/s10sim
       - run: iverilog -g2012 -s tb_s10_dma_stream -o /tmp/s10dma hardware/s10_binary_stream.v hardware/s10_dma_stream.v hardware/tb_s10_dma_stream.sv
