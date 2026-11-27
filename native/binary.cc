@@ -2,6 +2,8 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include "cpu-expand.h"
 
 namespace {
 struct Cache {
@@ -67,9 +69,34 @@ napi_value expand(napi_env env, napi_callback_info info) {
         result=args[4];
     } else if (napi_create_buffer(env, length, &dest, &result) != napi_ok) return fail(env, "Cannot allocate output");
     auto* out = static_cast<uint8_t*>(dest);
-    const auto& cache=get_cache(a,b);
     const size_t full = length / 10;
     size_t i = 0;
+    // Opt-in or automatic CPU ISA selection. No AVX instruction executes
+    // on an unsupported CPU. Scalar remains a reference and fallback.
+    static const bool avx=s10cpu::has_avx2(),bmi=s10cpu::has_bmi2();
+    const char* requested=std::getenv("S10_CPU_KERNEL");
+#if S10_X86_TARGET
+    if((!requested||std::strcmp(requested,"auto")==0||std::strcmp(requested,"avx2")==0)&&avx)
+        i=s10cpu::avx2(input,out,full,a,b);
+    else if(requested&&std::strcmp(requested,"bmi2")==0&&bmi)
+        i=s10cpu::bmi2(input,out,full,a,b);
+#endif
+    if(i==full&&length%10==0)return result;
+    // SIMD handles complete 20-byte units; a bounded scalar tail avoids
+    // preparing the large lookup table for changing palettes.
+    if(i!=0){
+        for(size_t j=i;j<(length+9)/10;j++){
+            uint8_t tmp[10]={};uint32_t bits=0,available=0,written=0;
+            for(unsigned s=0;s<8;s++){
+                bits|=((input[j]>>s)&1?b:a)<<available;available+=10;
+                while(available>=8){tmp[written++]=uint8_t(bits);bits>>=8;available-=8;}
+            }
+            const size_t n=length-j*10<10?length-j*10:10;
+            std::memcpy(out+j*10,tmp,n);
+        }
+        return result;
+    }
+    const auto& cache=get_cache(a,b);
     for (; i + 4 <= full; i += 4) {
         std::memcpy(out + 10*i, cache.entries[input[i]].data(), 10);
         std::memcpy(out + 10*i + 10, cache.entries[input[i+1]].data(), 10);
@@ -192,6 +219,12 @@ napi_value encode_binary(napi_env env,napi_callback_info info){
     if(napi_create_buffer_copy(env,bytes,packed.data(),nullptr,&result)!=napi_ok)return fail(env,"Cannot allocate encoded output");
     return result;
 }
+napi_value cpu_capabilities(napi_env env,napi_callback_info){
+    napi_value result,value;napi_create_object(env,&result);
+    napi_get_boolean(env,s10cpu::has_avx2(),&value);napi_set_named_property(env,result,"avx2",value);
+    napi_get_boolean(env,s10cpu::has_bmi2(),&value);napi_set_named_property(env,result,"bmi2",value);
+    return result;
+}
 napi_value init(napi_env env, napi_value exports) {
     napi_value fn;
     if (napi_create_function(env, "expand", NAPI_AUTO_LENGTH, expand, nullptr, &fn) != napi_ok ||
@@ -201,6 +234,8 @@ napi_value init(napi_env env, napi_value exports) {
        napi_set_named_property(env,exports,"expandPalette",fn)!=napi_ok)return fail(env,"Cannot initialize palette addon");
     if(napi_create_function(env,"encodeBinary",NAPI_AUTO_LENGTH,encode_binary,nullptr,&fn)!=napi_ok||
        napi_set_named_property(env,exports,"encodeBinary",fn)!=napi_ok)return fail(env,"Cannot initialize native encoder");
+    if(napi_create_function(env,"cpuCapabilities",NAPI_AUTO_LENGTH,cpu_capabilities,nullptr,&fn)!=napi_ok||
+       napi_set_named_property(env,exports,"cpuCapabilities",fn)!=napi_ok)return fail(env,"Cannot initialize CPU capabilities");
     return exports;
 }
 }

@@ -252,8 +252,22 @@ function decodeBlockInto(mode,payload,destination,dictionary){
     if(destination.buffer===payload.buffer&&destination.byteOffset<payload.byteOffset+payload.byteLength&&
        payload.byteOffset<destination.byteOffset+destination.byteLength)
         throw Error("Overlapping decode destination");
+    if(mode===RAW){
+        if(payload.length!==destination.length)throw Error("Invalid raw block length");
+        destination.set(payload);return destination;
+    }
     if(mode===PALETTE && process.env.S10_DISABLE_BINARY_FAST!=="1"){
         const layout=paletteLayout(payload,destination.length);
+        if(layout.width===0){
+            if(!(dictionary?.inverse instanceof Uint16Array)||dictionary.inverse.length!==SYMBOL_COUNT)
+                throw TypeError("Expected a Symbol10 inverse dictionary");
+            const v=dictionary.inverse[layout.view.getUint16(2,true)];
+            if(v>>>(destination.length*8-10*(layout.count-1)))throw Error("Invalid symbol padding");
+            if(v===0){destination.fill(0);return destination;}
+            const pattern=Buffer.from([v,(v>>>8)|(v<<2),(v>>>6)|(v<<4),(v>>>4)|(v<<6),v>>>2]);
+            Buffer.from(destination.buffer,destination.byteOffset,destination.byteLength).fill(pattern);
+            return destination;
+        }
         if(layout.width===1){
             if(!(dictionary?.inverse instanceof Uint16Array)||dictionary.inverse.length!==SYMBOL_COUNT)
                 throw TypeError("Expected a Symbol10 inverse dictionary");

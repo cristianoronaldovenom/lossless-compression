@@ -69,4 +69,5 @@ function encodeBinaryNative(raw,forward){
     return result===null?null:new Uint8Array(result.buffer,result.byteOffset,result.byteLength);
 }
 module.exports = { expandBinary, expandBinaryInto, expandWideNative, encodeBinaryNative,
+    cpuCapabilities:()=>native?.cpuCapabilities?.()??{avx2:false,bmi2:false},
     nativeEncoderAvailable:typeof native?.encodeBinary==="function",nativeEnabled: Boolean(native) };

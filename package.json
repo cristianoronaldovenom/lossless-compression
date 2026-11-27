@@ -14,7 +14,8 @@
     "build:native": "npx --yes node-gyp rebuild --directory native",
     "bench:portable": "node tools/bench-portable.cjs",
     "bench:gpu:resident": "node tools/bench-gpu-resident.cjs",
-    "bench:memory": "node tools/bench-memory.cjs"
+    "bench:memory": "node tools/bench-memory.cjs",
+    "bench:cpu": "node tools/bench-cpu.cjs"
   },
   "optionalDependencies": {
     "koffi": "3.3.8"
