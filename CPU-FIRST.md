@@ -1,0 +1,8 @@
+# CPU-first Symbol10
+New runtime-selected native AVX2 binary expansion: two compressed bytes become 20 decoded bytes with parallel arithmetic and bounded vector stores. No per-palette LUT construction on the vector path. BMI2 is an experimental alternative; scalar LUT is retained. The archive format and SHA-256 verification are unchanged. Raw and zero/repeated direct-output decoding no longer allocate an intermediate output. ARM and unsupported x86 use the portable LUT. Windows uses explicit intrinsics with CPUID and OS extended-state checking; Windows build needs validation.
+Build: npm run build:native
+Test: npm test
+Benchmark: npm run bench:cpu -- 14 256 1
+Use a worker count supported by the machine. Benchmark reports raw and SHA-256-verified rates separately, three trials, median, actual total output working set and available ISA. Use an output working set bigger than aggregate cache to probe sustained memory traffic; the benchmark is synthetic, not disk or driver throughput. Native kernel overrides: S10_CPU_KERNEL=scalar, avx2, bmi2, auto. Unsupported strategies fall back safely. Default uses AVX2 when supported. Hardware remains unverified on Core Ultra 5. No claim of 80 GB/s or transparent RAM compression.
+
+Native encoding now detects two symbols, uses packed 40-bit XOR comparisons and BMI2 PEXT/PDEP on supported CPUs (scalar exact-match fallback otherwise). Enabled automatically when native addon is present; S10_ENABLE_NATIVE_ENCODE=0 disables it. Kernel selection is explicitly passed from JS to native thread-local state, so independent workers can select implementations reliably. Encoder always checks all bits and rejects any third symbol.

@@ -76,6 +76,10 @@ node .\symbol10.cjs info firmware-input.s10 --json
 
 The firmware path uses a portable C decoder shared by the desktop emulator and Raspberry Pi Pico USB builds. The host runs Symbol10 language programs and passes raw and palette blocks to the firmware bridge. See [firmware setup and verification](firmware/README.md) for build commands and USB usage.
 
+## Experimental one-bit fast path
+
+See [one-bit performance and build guide](ONE-BIT-ECO.md) for binary palette optimization, optional native CPU acceleration, and the eco worker setting.
+
 ## Faster decoding
 
 The CPU path reads contiguous batches of up to 128 chunks (8 MiB of original data) and expands groups of eight symbols together. Install the optional dependency on a little-endian 64-bit Windows, Linux, or macOS host to use a GPU exposed by its OpenCL driver.
@@ -135,3 +139,5 @@ node tools/benchmark.cjs --size-mib=8 --runs=3 --workers=4 --gpu=0
 The CPU tests need no optional native packages. Run `npm ci --omit=optional` for a CPU-only install. GPU testing requires the OpenCL binding and driver. The workload benchmark generates fixed-seed raw, palette, DEFLATE, and mixed fixtures. It measures packing, verification, and full restores, and compares each restored file with the original digest. It compares serial and worker configurations when the worker count exceeds one. Omit the GPU flag to measure the CPU only.
 
 Transparent Windows application opens and system-wide RAM compression require separate operating-system integration.
+
+See [binary-first mathematical architecture](SYMBOL-MATH-ARCHITECTURE.md) for exact size, throughput and ASIC datapath specifications.

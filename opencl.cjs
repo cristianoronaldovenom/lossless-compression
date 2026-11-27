@@ -12,6 +12,13 @@ const WORDS_PER_GROUP = 1020;
 const MAX_BATCH_BLOCKS = 128;
 const SHARED_MEMORY_BATCH_BLOCKS = 32;
 const ZERO = Buffer.alloc(4);
+function requestedBatch(max) {
+    const raw=process.env.S10_GPU_BATCH_BLOCKS;
+    if(raw===undefined)return max;
+    const value=Number(raw);
+    if(!Number.isInteger(value)||value<1||value>128)throw Error("S10_GPU_BATCH_BLOCKS must be 1..128");
+    return Math.min(max,value);
+}
 let kernelSource;
 
 class OpenClError extends Error {}
@@ -41,8 +48,11 @@ function loadApi() {
     };
     const locate = loaders[process.platform];
     if (!locate) throw Error("OpenCL is unavailable on " + process.platform);
-    const loader = locate();
-    const lib = ffi.load(loader);
+    const explicit=process.env.S10_OPENCL_LIBRARY;
+    const names=explicit?[explicit]:[locate(),...(process.platform==="linux"?["libOpenCL.so"]:[])];
+    let lib,lastError;
+    for(const name of names){try{lib=ffi.load(name);break;}catch(error){lastError=error;}}
+    if(!lib)throw Error("OpenCL loader unavailable: "+lastError?.message);
     const bind = signature => lib.func(signature);
     return {
         platforms: bind("int clGetPlatformIDs(uint32_t, void *, void *)"),
@@ -62,6 +72,7 @@ function loadApi() {
         fill: bind("int clEnqueueFillBuffer(uintptr_t, uintptr_t, const void *, size_t, size_t, size_t, uint32_t, void *, void *)"),
         run: bind("int clEnqueueNDRangeKernel(uintptr_t, uintptr_t, uint32_t, void *, void *, void *, uint32_t, void *, void *)"),
         flush: bind("int clFlush(uintptr_t)"),
+        finishQueue: bind("int clFinish(uintptr_t)"),
         profile: bind("int clGetEventProfilingInfo(uintptr_t, uint32_t, size_t, void *, void *)"),
         releaseEvent: bind("int clReleaseEvent(uintptr_t)"),
         release: name => bind("int clRelease" + name + "(uintptr_t)")
@@ -117,11 +128,15 @@ function enumerate(api) {
                 adapter.version = canQueryCompiler ? text(0x103d) : runtime;
                 adapter.unified = canQueryCompiler && Boolean(uint(0x1035));
                 adapter.computeUnits = uint(0x1002);
+                adapter.clockMHz = uint(0x100c);
+                adapter.globalMemoryBytes = Number(deviceInfo(api,id,0x101f,8).readBigUInt64LE());
+                adapter.maxAllocationBytes = Number(deviceInfo(api,id,0x1010,8).readBigUInt64LE());
+                adapter.driver = text(0x102d);
                 const [, major, minor] = /^OpenCL C (\d+)\.(\d+)/.exec(adapter.version) ?? [];
                 const compiler = Number(major) >= 2 || (Number(major) === 1 && Number(minor) >= 2);
                 adapter.dimensions = uint(0x1003);
                 const localMemory = deviceInfo(api, id, 0x1023, 8).readBigUInt64LE();
-                adapter.supported = compiler && adapter.dimensions >= 2 && localMemory >= BigInt(SYMBOLS * 2) &&
+                adapter.supported = compiler && adapter.dimensions >= 2 && localMemory >= BigInt(SYMBOLS * 2 + 128) &&
                     Boolean(uint(0x1026) && uint(0x1027) && uint(0x1028));
             } catch (error) {
                 adapter.name ??= "OpenCL adapter " + adapter.index;
@@ -142,7 +157,7 @@ function listGpus() {
     return devices.map(({ id, platform, dimensions, ...details }) => details);
 }
 
-function createGpu(inverse, index) {
+function createGpu(inverse, index, options = {}) {
     if (!(inverse instanceof Uint16Array) || inverse.length !== SYMBOLS ||
         inverse.some(value => value >= SYMBOLS) || new Set(inverse).size !== SYMBOLS) {
         throw Error("Invalid GPU inverse dictionary");
@@ -157,16 +172,23 @@ function createGpu(inverse, index) {
         throw Error([unavailable, ...failures].join("\n"));
     }
     for (const device of candidates) {
-        try { return new GpuDecoder(inverse, api, device); }
+        try { return new GpuDecoder(inverse, api, device, options); }
         catch (error) { failures.push(device.name + ": " + error.message); }
     }
     throw Error(failures.join("\n"));
 }
 
 class GpuDecoder {
-    constructor(inverse, api, adapter) {
+    constructor(inverse, api, adapter, options={}) {
+        this.binaryKernel=options.binaryKernel??process.env.S10_GPU_BINARY_KERNEL??"legacy";
+        if(!["legacy","coalesced","vector4"].includes(this.binaryKernel))throw Error("Invalid GPU binary kernel");
+        this.residentBlocks=options.residentBlocks;
+        if(this.residentBlocks!==undefined&&(!Number.isInteger(this.residentBlocks)||this.residentBlocks<128||this.residentBlocks>2048))
+            throw Error("residentBlocks must be 128..2048");
         this.api = api;
         this.resources = [];
+        this.pending = [];
+        this.slots = [];
         this.kernelNs = 0;
         this.profiledBytes = 0;
         this.decodedBytes = 0;
@@ -180,10 +202,12 @@ class GpuDecoder {
         };
         try {
             const device = adapter.id;
+            if(this.binaryKernel!=="legacy"&&deviceInfo(api,device,0x1023,8).readBigUInt64LE()<2368n)
+                throw Error("Insufficient local memory for phase lookup table");
             const deviceId = sizeArray(device);
             this.name = adapter.name;
             const context = own("Context", api.context, sizeArray(0x1084, adapter.platform, 0), 1, deviceId, null, null);
-            this.queue = own("CommandQueue", api.queue, context, device, 2);
+            const queue = own("CommandQueue", api.queue, context, device, 2);
             kernelSource ??= fs.readFileSync(path.join(__dirname, "palette.cl"), "utf8");
             const program = own("Program", api.program, context, 1, [kernelSource], null);
             const options = [
@@ -192,7 +216,8 @@ class GpuDecoder {
                 "-DDESCRIPTOR_WORDS=" + DESCRIPTOR_WORDS,
                 "-DHEADER_WORDS=" + OUTPUT_HEADER_BYTES / 4,
                 "-DSYMBOL_COUNT=" + SYMBOLS,
-                "-DWORDS_PER_GROUP=" + WORDS_PER_GROUP
+                "-DWORDS_PER_GROUP=" + WORDS_PER_GROUP,
+                "-DS10_COALESCED_BINARY=" + ({legacy:0,coalesced:1,vector4:2}[this.binaryKernel])
             ].join(" ");
             const built = api.build(program, 1, deviceId, options, null, null);
             if (built !== 0) {
@@ -202,10 +227,10 @@ class GpuDecoder {
                 checked(api.buildInfo(program, device, 0x1183, log.length, log, null), "Read build log");
                 throw Error("OpenCL program build failed: " + log.toString());
             }
-            this.kernel = own("Kernel", api.kernel, program, "expand");
+            const kernel = own("Kernel", api.kernel, program, "expand");
             const kernelSize = key => {
                 const value = Buffer.alloc(8);
-                checked(api.kernelInfo(this.kernel, device, key, 8, value, null), "Read kernel work-group limits");
+                checked(api.kernelInfo(kernel, device, key, 8, value, null), "Read kernel work-group limits");
                 return Number(value.readBigUInt64LE());
             };
             const firstDimension = Number(deviceInfo(api, device, 0x1005, adapter.dimensions * 8).readBigUInt64LE());
@@ -215,34 +240,47 @@ class GpuDecoder {
             this.groupSize = preferred > 0 && preferred <= cap ? Math.floor(cap / preferred) * preferred : cap;
             this.localSize = sizeArray(this.groupSize, 1);
             const allocation = Number(deviceInfo(api, device, 0x1010, 8).readBigUInt64LE());
-            this.batchBlocks = Math.min(adapter.unified ? SHARED_MEMORY_BATCH_BLOCKS : MAX_BATCH_BLOCKS,
-                Math.floor((allocation - OUTPUT_HEADER_BYTES) / CHUNK));
+            const safeBlocks=Math.min(Math.floor((allocation-Math.max(OUTPUT_HEADER_BYTES,INPUT_GUARD_BYTES))/CHUNK),
+                Math.floor(adapter.globalMemoryBytes/(8*CHUNK)));
+            this.batchBlocks=this.residentBlocks===undefined?
+                requestedBatch(Math.min(adapter.unified?SHARED_MEMORY_BATCH_BLOCKS:MAX_BATCH_BLOCKS,safeBlocks)):
+                Math.min(this.residentBlocks,safeBlocks);
             if (this.batchBlocks < 1) throw Error("GPU allocation limit is too small");
             const allocate = (flags, bytes) => own("MemObject", api.buffer, context, flags, bytes, null);
-            this.input = allocate(4, CHUNK * this.batchBlocks + INPUT_GUARD_BYTES);
-            this.jobs = allocate(4, DESCRIPTOR_WORDS * 4 * this.batchBlocks);
             const dictionary = allocate(4, inverse.byteLength);
-            this.output = allocate(1, OUTPUT_HEADER_BYTES + CHUNK * this.batchBlocks);
-            [this.input, this.jobs, dictionary, this.output].forEach((buffer, index) => {
-                checked(api.arg(this.kernel, index, 8, sizeArray(buffer)), "Bind kernel argument");
-            });
-            this.write(dictionary, inverse);
+            this.pipelineSlots = this.residentBlocks!==undefined||process.env.S10_GPU_SLOTS === "1" ? 1 : 2;
+            for (let i = 0; i < this.pipelineSlots; i++) {
+                const slot = {
+                    queue: i === 0 ? queue : own("CommandQueue", api.queue, context, device, 2),
+                    kernel: i === 0 ? kernel : own("Kernel", api.kernel, program, "expand"),
+                    input: allocate(4, CHUNK * this.batchBlocks + INPUT_GUARD_BYTES),
+                    jobs: allocate(4, DESCRIPTOR_WORDS * 4 * this.batchBlocks),
+                    output: allocate(1, OUTPUT_HEADER_BYTES + CHUNK * this.batchBlocks),
+                    busy: false
+                };
+                [slot.input, slot.jobs, dictionary, slot.output].forEach((buffer, index) => {
+                    checked(api.arg(slot.kernel, index, 8, sizeArray(buffer)), "Bind kernel argument");
+                });
+                this.slots.push(slot);
+            }
+            this.write(queue, dictionary, inverse);
         } catch (error) {
             this.close();
             throw error;
         }
     }
 
-    write(handle, bytes) {
-        checked(this.api.write(this.queue, handle, 1, 0, bytes.byteLength, bytes, 0, null, null), "Upload");
+    write(queue, handle, bytes) {
+        checked(this.api.write(queue, handle, 1, 0, bytes.byteLength, bytes, 0, null, null), "Upload");
     }
 
-    read(handle, bytes) {
-        checked(this.api.read(this.queue, handle, 1, 0, bytes.byteLength, bytes, 0, null, null), "Download");
+    read(queue, handle, bytes) {
+        checked(this.api.read(queue, handle, 1, 0, bytes.byteLength, bytes, 0, null, null), "Download");
     }
 
     submit(payload, descriptors, count) {
-        if (this.pending) throw Error("GPU decoder already has a pending batch");
+        const slot = this.slots.find(item => !item.busy);
+        if (!slot) throw Error("GPU decoder has no free batch slot");
         if (!this.resources.length) throw Error("GPU decoder is closed");
         if (!(payload instanceof Uint8Array) || !(descriptors instanceof Uint32Array) ||
             !Number.isInteger(count) || count < 1 || count > this.batchBlocks ||
@@ -270,31 +308,36 @@ class GpuDecoder {
             decodedBytes += length;
             longestBlock = Math.max(longestBlock, length);
         }
-        this.write(this.input, payload);
-        this.write(this.jobs, descriptors);
-        checked(this.api.fill(this.queue, this.output, ZERO, ZERO.length, 0, OUTPUT_HEADER_BYTES, 0, null, null),
+        this.write(slot.queue, slot.input, payload);
+        this.write(slot.queue, slot.jobs, descriptors);
+        checked(this.api.fill(slot.queue, slot.output, ZERO, ZERO.length, 0, OUTPUT_HEADER_BYTES, 0, null, null),
             "Clear decode status");
         const event = Buffer.alloc(8);
         const groups = Math.ceil(longestBlock / (WORDS_PER_GROUP * 4));
         const globalSize = sizeArray(groups * this.groupSize, count);
-        checked(this.api.run(this.queue, this.kernel, 2, null, globalSize, this.localSize,
+        checked(this.api.run(slot.queue, slot.kernel, 2, null, globalSize, this.localSize,
             0, null, event), "Dispatch decode");
-        this.pending = { handle: event.readBigUInt64LE(), descriptors, count, decodedBytes };
+        slot.busy = true;
+        this.pending.push({ slot, handle: event.readBigUInt64LE(), descriptors, count, decodedBytes, flushed:false });
     }
 
     flush() {
-        checked(this.api.flush(this.queue), "Flush decode queue");
+        for (const job of this.pending) {
+            if (!job.flushed) {
+                checked(this.api.flush(job.slot.queue), "Flush decode queue");
+                job.flushed=true;
+            }
+        }
     }
 
     finish() {
-        if (!this.pending) throw Error("GPU decoder has no pending batch");
-        const { handle, descriptors, count, decodedBytes } = this.pending;
-        this.pending = undefined;
+        if (!this.pending.length) throw Error("GPU decoder has no pending batch");
+        const { slot, handle, descriptors, count, decodedBytes } = this.pending.shift();
         try {
             const lastLength = descriptors[descriptors.length - 1];
             const resultLength = (count - 1) * CHUNK + lastLength;
-            const result = Buffer.allocUnsafe(OUTPUT_HEADER_BYTES + Math.ceil(resultLength / 4) * 4);
-            this.read(this.output, result);
+            const result = Buffer.allocUnsafeSlow(OUTPUT_HEADER_BYTES + Math.ceil(resultLength / 4) * 4);
+            this.read(slot.queue, slot.output, result);
             if (result.readUInt32LE()) throw Error("Invalid GPU palette index, symbol, or symbol padding");
             const stamp = key => {
                 const value = Buffer.alloc(8);
@@ -316,6 +359,53 @@ class GpuDecoder {
             return result.subarray(OUTPUT_HEADER_BYTES, OUTPUT_HEADER_BYTES + resultLength);
         } finally {
             this.api.releaseEvent(handle);
+            slot.busy = false;
+        }
+    }
+
+    // Benchmark-only: input and descriptors stay in device memory.
+    // The archive path still performs ordinary checked readback.
+    benchmarkResident(payload,descriptors,count,iterations=15){
+        if(this.residentBlocks===undefined||this.pending.length)throw Error("Use a dedicated resident benchmark decoder");
+        if(!Number.isInteger(iterations)||iterations<3||iterations>100)throw Error("Invalid resident iteration count");
+        if(descriptors.length!==count*DESCRIPTOR_WORDS||Array.from({length:count},(_,i)=>descriptors[i*DESCRIPTOR_WORDS+4]).some(n=>n!==CHUNK))
+            throw Error("Resident benchmark requires complete blocks");
+        this.submit(payload,descriptors,count);
+        const slot=this.pending[0].slot;
+        const first=this.finish(); // Warm device and validate status.
+        const globalSize=sizeArray(Math.ceil(CHUNK/(WORDS_PER_GROUP*4))*this.groupSize,count);
+        const handles=[];
+        const stamp=(event,key)=>{
+            const value=Buffer.alloc(8);
+            checked(this.api.profile(event,key,8,value,null),"Read GPU event timing");
+            return value.readBigUInt64LE();
+        };
+        const startWall=process.hrtime.bigint();
+        try{
+            for(let i=0;i<iterations;i++){
+                const event=Buffer.alloc(8);
+                checked(this.api.run(slot.queue,slot.kernel,2,null,globalSize,this.localSize,0,null,event),"Resident decode dispatch");
+                handles.push(event.readBigUInt64LE());
+            }
+            checked(this.api.finishQueue(slot.queue),"Wait for resident kernels");
+            const wallNs=Number(process.hrtime.bigint()-startWall);
+            const spans=handles.map(e=>[stamp(e,0x1282),stamp(e,0x1283)]);
+            const ns=spans.map(([a,b])=>Number(b-a));
+            if(ns.some(n=>n<=0))throw Error("Invalid device timing");
+            const spanNs=Number(spans.at(-1)[1]-spans[0][0]);
+            if(spanNs<=0||wallNs<=0)throw Error("Invalid benchmark timing span");
+            const final=Buffer.allocUnsafeSlow(OUTPUT_HEADER_BYTES+count*CHUNK);
+            this.read(slot.queue,slot.output,final);
+            if(final.readUInt32LE()||!first.equals(final.subarray(OUTPUT_HEADER_BYTES)))
+                throw Error("Resident output changed or failed validation");
+            const bytes=count*CHUNK, ordered=ns.slice().sort((a,b)=>a-b);
+            return {output:first,bytes,iterations,kernelTimesNs:ns,
+                medianKernelGBps:bytes/ordered[Math.floor(ordered.length/2)],
+                deviceSpanGBps:bytes*iterations/spanNs,hostLaunchGBps:bytes*iterations/wallNs,
+                note:"Resident raw expansion; excludes input upload, output download and SHA-256"};
+        }finally{
+            this.api.finishQueue(slot.queue);
+            for(const h of handles)this.api.releaseEvent(h);
         }
     }
 
@@ -325,14 +415,19 @@ class GpuDecoder {
     }
 
     discard() {
-        if (!this.pending) return;
-        this.api.releaseEvent(this.pending.handle);
-        this.pending = undefined;
+        // Drain every queue, including a partially submitted batch, before reuse.
+        for (const slot of this.slots) this.api.finishQueue(slot.queue);
+        for (const {slot,handle} of this.pending) {
+            this.api.releaseEvent(handle);
+            slot.busy = false;
+        }
+        this.pending.length = 0;
     }
 
     close() {
         this.discard();
         while (this.resources.length) this.resources.pop()();
+        this.slots.length = 0;
     }
 }
 

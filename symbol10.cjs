@@ -254,6 +254,7 @@ function prepareBatch(fd, archive, first, last, gpu, scratch, flush = false) {
     const descriptors = gpu ? new Uint32Array((last - first) * 5) : undefined;
     const blocks = [];
     const deviceBlocks = [];
+    const cpuBlocks = [];
     let paletteBytes = 0;
     for (let block = first; block < last; block++) {
         const entry = block * ENTRY_BYTES;
@@ -261,13 +262,14 @@ function prepareBatch(fd, archive, first, last, gpu, scratch, flush = false) {
         const payload = bytes.subarray(offset, offset + archive.index.readUInt32LE(entry + 8));
         const rawLength = Math.min(CHUNK_BYTES, archive.rawSize - block * CHUNK_BYTES);
         const mode = archive.index[entry + 12];
-        if (gpu && mode === PALETTE) {
-            const layout = paletteLayout(payload, rawLength);
+        const layout = gpu && mode === PALETTE ? paletteLayout(payload, rawLength) : undefined;
+        if (layout && (!gpu.supportsWidth || gpu.supportsWidth(layout.width))) {
             descriptors.set([offset + 2, offset + layout.paletteEnd, layout.paletteLength, layout.width, rawLength], deviceBlocks.length * 5);
             deviceBlocks.push({ block, rawLength, payload });
             paletteBytes += payload.length;
         } else {
-            blocks[block - first] = decodeBlock(mode, payload, rawLength, archive.dictionary);
+            if (gpu) cpuBlocks.push({block,mode,payload,rawLength});
+            else blocks[block - first] = decodeBlock(mode, payload, rawLength, archive.dictionary);
         }
     }
     let ready;
@@ -288,14 +290,20 @@ function prepareBatch(fd, archive, first, last, gpu, scratch, flush = false) {
             input.fill(0, offset);
         }
         const jobs = descriptors.subarray(0, deviceBlocks.length * 5);
-        if (flush) {
-            gpu.submit(input, jobs, deviceBlocks.length);
-            gpu.flush();
-        } else ready = gpu.decode(input, jobs, deviceBlocks.length);
+        gpu.submit(input, jobs, deviceBlocks.length);
+        gpu.flush();
     }
+    // CPU-only codecs execute while the GPU kernel is running.
+    try {
+        for (const {block,mode,payload,rawLength} of cpuBlocks)
+            blocks[block-first] = decodeBlock(mode,payload,rawLength,archive.dictionary);
+    } catch(error) { gpu?.discard(); throw error; }
+    if (deviceBlocks.length && !flush) ready = gpu.finish();
     return () => {
         if (deviceBlocks.length) {
             const decoded = ready ?? gpu.finish();
+            // Dedicated readback allocation can be transferred to a verifier.
+            blocks.deviceBuffer = decoded;
             deviceBlocks.forEach(({ block, rawLength }, row) => {
                 blocks[block - first] = decoded.subarray(row * CHUNK_BYTES, row * CHUNK_BYTES + rawLength);
             });
@@ -318,7 +326,8 @@ function decodeBatch(fd, archive, first, last, gpu, scratch) {
     return verifyBatch(archive, first, prepareBatch(fd, archive, first, last, gpu, scratch)());
 }
 
-function openArchive(source, { gpu: useGpu = false, gpuPipeline = false } = {}) {
+function openArchive(source, { gpu: useGpu = false, gpuPipeline = false, fpgaDriver } = {}) {
+    if(fpgaDriver!==undefined && useGpu!==false)throw Error("Choose either GPU or FPGA");
     if (![false, true, "auto"].includes(useGpu) && (!Number.isSafeInteger(useGpu) || useGpu < 0)) {
         throw TypeError("GPU selection must be false, true, auto, or an adapter index");
     }
@@ -327,7 +336,8 @@ function openArchive(source, { gpu: useGpu = false, gpuPipeline = false } = {}) 
     try {
         archive = inspectArchive(fd);
         archive.dictionary = makeDictionary(archive.seed);
-        if (useGpu !== false && useGpu !== "auto") {
+        if (fpgaDriver!==undefined) gpu=require("./fpga-backend.cjs").createFpga(archive.dictionary.inverse,fpgaDriver);
+        else if (useGpu !== false && useGpu !== "auto") {
             gpu = require("./opencl.cjs").createGpu(archive.dictionary.inverse, useGpu === true ? undefined : useGpu);
         }
     } catch (error) {
@@ -339,7 +349,7 @@ function openArchive(source, { gpu: useGpu = false, gpuPipeline = false } = {}) 
     let fallback;
     let failedGpu;
     const scratch = { bytes: Buffer.alloc(0) };
-    const pipelineScratch = [{ bytes: Buffer.alloc(0) }, { bytes: Buffer.alloc(0) }];
+    const pipelineScratch = Array.from({length:3}, () => ({bytes:Buffer.alloc(0)}));
     function disableGpu(error) {
         fallback = error.message;
         failedGpu = { gpuBytes: gpu.decodedBytes || 0, profiledBytes: gpu.profiledBytes || 0,
@@ -375,48 +385,24 @@ function openArchive(source, { gpu: useGpu = false, gpuPipeline = false } = {}) 
                 return raw.subarray(Math.max(0, start - base), end - base);
             }));
         }
-        // Only internal consumers that finish with each batch before returning may
-        // use the two reusable input buffers. Public visitors can retain references.
+        // Two distinct GPU queues allow the next upload/kernel to overlap
+        // the previous kernel and readback. Scratch stays owned by its batch.
         if (gpuPipeline && reuse && gpu && useAccelerator) {
-            // Reuse the device buffers only after readback. While the next kernel
-            // runs, the CPU verifies the previous batch's independent host buffers.
-            function submit(first, slot) {
-                const activeGpu = gpu;
-                const last = Math.min(first + (activeGpu?.batchBlocks ?? BATCH_BLOCKS), limit);
-                const retry = error => {
-                    if (!automatic || !activeGpu || !(error instanceof require("./opencl.cjs").OpenClError)) throw error;
-                    disableGpu(error);
-                    return prepareBatch(fd, archive, first, last)();
-                };
-                let finish;
-                try { finish = prepareBatch(fd, archive, first, last, activeGpu, pipelineScratch[slot], true); }
-                catch (error) {
-                    const blocks = retry(error);
-                    return { first, last, collect: () => blocks };
-                }
-                return { first, last, collect() {
-                    try { return finish(); }
-                    catch (error) { return retry(error); }
-                } };
-            }
+            let cursor = startBlock;
             try {
-                let slot = 0, batch = submit(startBlock, slot);
-                while (batch) {
-                    const blocks = batch.collect();
-                    if (!gpu) {
-                        deliver(batch.first, verifyBatch(archive, batch.first, blocks));
-                        // Let the normal CPU loop finish with its reusable scratch.
-                        for (let first = batch.last; first < limit; first += BATCH_BLOCKS) {
-                            deliver(first, decodeBatch(fd, archive, first, Math.min(first + BATCH_BLOCKS, limit), undefined, scratch));
-                        }
-                        break;
-                    }
-                    let next, nextError;
-                    try { if (batch.last < limit) next = submit(batch.last, slot ^= 1); }
-                    catch (error) { nextError = error; }
-                    deliver(batch.first, verifyBatch(archive, batch.first, blocks));
-                    if (nextError) throw nextError;
-                    batch = next;
+                require("./ordered-pipeline.cjs").runPipeline({
+                    start:startBlock,end:limit,batchSize:gpu.batchBlocks,slots:gpu.pipelineSlots,
+                    submit:(first,last,slot)=>prepareBatch(fd,archive,first,last,gpu,pipelineScratch[slot],true),
+                    collect:finish=>finish(),
+                    deliver:(first,blocks)=>deliver(first,verifyBatch(archive,first,blocks)),
+                    onProgress:last=>{cursor=last;}
+                });
+            } catch (error) {
+                if (!automatic || !(error instanceof require("./opencl.cjs").OpenClError)) throw error;
+                disableGpu(error);
+                // Only retry batches not delivered; corrupt data still fails validation.
+                for (; cursor < limit; cursor += BATCH_BLOCKS) {
+                    deliver(cursor, decodeBatch(fd, archive, cursor, Math.min(cursor + BATCH_BLOCKS, limit), undefined, scratch));
                 }
             } finally { gpu?.discard(); }
             return;
@@ -532,7 +518,66 @@ async function extractParallel(source, destination, start, length, workers) {
     }
 }
 
+// Opt-in hybrid archive path. CPU verifier workers receive GPU readback by
+// ownership transfer, not a second full-size copy. Never publish unchecked rows.
+async function extractHybrid(source,destination,start,length,useGpu,workers) {
+    const {runOrdered}=require("./codec-worker.cjs");
+    const {makeVerifyJob}=require("./verify-decoded.cjs");
+    const {createGpu,OpenClError}=require("./opencl.cjs");
+    const fd=fs.openSync(source,fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK??0));
+    let gpu;
+    try {
+        const archive=inspectArchive(fd);
+        archive.dictionary=makeDictionary(archive.seed);
+        const size=length??archive.rawSize-start;
+        if(!Number.isSafeInteger(start)||!Number.isSafeInteger(size)||start<0||size<0||start>archive.rawSize-size)
+            throw Error("Byte range exceeds archive");
+        const end=start+size, firstBlock=Math.floor(start/CHUNK_BYTES), limit=Math.ceil(end/CHUNK_BYTES);
+        const restore=destination!==null;
+        const automatic=useGpu==="auto";
+        if(size){
+            try { gpu=createGpu(archive.dictionary.inverse, useGpu===true||automatic?undefined:useGpu); }
+            catch(error){if(!automatic)throw error;console.error("CPU fallback: "+error.message);}
+        }
+        const scratch={bytes:Buffer.alloc(0)};
+        function* jobs(){
+            let cursor=firstBlock;
+            while(size&&cursor<limit){
+                const last=Math.min(limit,cursor+(gpu?.batchBlocks??16));
+                let blocks;
+                try { blocks=prepareBatch(fd,archive,cursor,last,gpu,scratch)(); }
+                catch(error){
+                    if(!automatic||!gpu||!(error instanceof OpenClError))throw error;
+                    console.error("CPU fallback: "+error.message);
+                    gpu.close();gpu=undefined;
+                    blocks=prepareBatch(fd,archive,cursor,last,undefined,scratch)();
+                }
+                const job=makeVerifyJob(blocks,archive.index,cursor,ENTRY_BYTES,restore);
+                cursor=last;
+                yield job;
+            }
+        }
+        const transfer=async output=>{
+            for await(const result of runOrdered(jobs(),{verifyDecoded:true},workers)){
+                if(restore){
+                    const parts=result.rows.map((raw,i)=>{
+                        const base=(result.first+i)*CHUNK_BYTES;
+                        return raw.subarray(Math.max(0,start-base),end-base);
+                    });
+                    writeBatch(output,parts);
+                }
+            }
+        };
+        if(restore)await publishFile(destination,transfer);else await transfer(null);
+    }finally{try{gpu?.close();}finally{fs.closeSync(fd);}}
+}
+function verificationWorkers(){
+    const value=process.env.S10_VERIFY_WORKERS;
+    return value===undefined?1:workerCount(value);
+}
+
 async function extract(source, destination, start = 0, length = undefined, useGpu = false, workers = 1, gpuPipeline = false) {
+    if(useGpu!==false && verificationWorkers()>1) return extractHybrid(source,destination,start,length,useGpu,verificationWorkers());
     if (workers > 1) return extractParallel(source, destination, start, length, workers);
     const reader = openArchive(source, { gpu: useGpu, gpuPipeline });
     try {
@@ -544,7 +589,20 @@ async function extract(source, destination, start = 0, length = undefined, useGp
     }
 }
 
-function benchmarkDecode(source, useGpu, minimumSeconds = 0, gpuPipeline = false) {
+async function benchmarkDecode(source, useGpu, minimumSeconds = 0, gpuPipeline = false) {
+    if(useGpu!==false && verificationWorkers()>1){
+        const size=archiveInfo(source).originalBytes, workers=verificationWorkers();
+        const start=performance.now(),cpu=process.cpuUsage();
+        let passes=0,seconds;
+        do {
+            await extractHybrid(source,null,0,undefined,useGpu,workers);
+            passes++;seconds=(performance.now()-start)/1000;
+        }while(passes<3||seconds<minimumSeconds);
+        const usage=process.cpuUsage(cpu),logical=require("node:os").availableParallelism?.()??require("node:os").cpus().length;
+        console.log("Hybrid verified decode (includes worker and GPU setup): "+(passes*size/seconds/1e9).toFixed(3)+" GB/s");
+        console.log("Process CPU: "+(100*(usage.user+usage.system)/1e6/seconds/logical).toFixed(2)+"%, "+workers+" verifier workers");
+        return;
+    }
     const init = performance.now();
     const reader = openArchive(source, { gpu: useGpu, gpuPipeline });
     try {
@@ -553,6 +611,7 @@ function benchmarkDecode(source, useGpu, minimumSeconds = 0, gpuPipeline = false
         console.log("Open and first verified read: " + (ready - init).toFixed(1) + " ms");
         const before = reader.counters();
         const start = performance.now();
+        const cpuStart = process.cpuUsage();
         let passes = 0;
         let seconds;
         do {
@@ -563,6 +622,10 @@ function benchmarkDecode(source, useGpu, minimumSeconds = 0, gpuPipeline = false
         const stats = reader.counters();
         console.log("Warm verified decode: " + (passes * reader.size / seconds / 1e9).toFixed(3) +
             " GB/s (" + passes + " passes, " + reader.size + " bytes each)");
+        const cpu = process.cpuUsage(cpuStart);
+        const logical = require("node:os").availableParallelism?.() ?? require("node:os").cpus().length;
+        const cores = (cpu.user + cpu.system) / 1e6 / seconds;
+        console.log("Process CPU: " + cores.toFixed(2) + " logical cores, " + (100 * cores / logical).toFixed(1) + "% of " + logical + " available logical CPUs");
         if (stats.fallback) console.log("CPU fallback: " + stats.fallback);
         if (stats.device) {
             const gpuBytes = stats.gpuBytes - before.gpuBytes;
@@ -572,8 +635,8 @@ function benchmarkDecode(source, useGpu, minimumSeconds = 0, gpuPipeline = false
             const profiled = stats.profiledBytes - before.profiledBytes;
             if (ns > 0 && profiled > 0) {
                 console.log("Palette kernel only: " + (profiled / ns).toFixed(3) + " GB/s");
-                if (profiled === gpuBytes) console.log("Profiled kernel time / verified wall time: " +
-                    (ns / (seconds * 1e7)).toFixed(2) + "% (not GPU utilization)");
+                if (profiled === gpuBytes) console.log("Summed kernel time / verified wall time: " +
+                    (ns / (seconds * 1e7)).toFixed(2) + "% (overlap can exceed 100%; not GPU utilization)");
             }
         }
     } finally {
@@ -653,6 +716,20 @@ function testGpu(dictionary, selection) {
                 }
                 batch.push({ raw, bytes: encodePalette(raw, dictionary) });
             }
+        }
+        // Exercise every 20-byte binary tile tail and both dictionary values.
+        for (let tail = 0; tail < 20; tail++) {
+            const raw = Buffer.alloc(CHUNK_BYTES - tail);
+            let bits = 0, available = 0, pos = 0;
+            const count = Math.ceil(raw.length * 8 / 10);
+            for (let j = 0; j < count; j++) {
+                bits |= (j === count-1 ? 0 : j & 1 ? 1023 : 0) << available;
+                available += 10;
+                while (available >= 8 && pos < raw.length) {
+                    raw[pos++] = bits & 255; bits >>>= 8; available -= 8;
+                }
+            }
+            batch.push({raw, bytes: encodePalette(raw, dictionary)});
         }
         // A nonzero one-entry palette exercises the repeating five-byte pattern.
         const repeated = Buffer.alloc(64000, 255);
@@ -797,7 +874,7 @@ function nonnegative(value) {
 }
 
 function workerCount(value) {
-    const workers = nonnegative(value);
+    const workers = value === "eco" ? Math.max(1, Math.min(16, Math.floor((require("node:os").availableParallelism?.() ?? require("node:os").cpus().length) / 4))) : nonnegative(value);
     if (workers < 1 || workers > 16) throw Error("Worker count must be between 1 and 16");
     return workers;
 }
@@ -811,6 +888,10 @@ const usage = "node symbol10.cjs pack <file|-> <archive> [--fast-decode] [--work
     "node symbol10.cjs bench-decode <archive> [--gpu|--gpu=auto|--gpu=INDEX] [--gpu-pipeline] [--seconds=N]\n" +
     "node symbol10.cjs bench <file>\n" +
     "node symbol10.cjs devices\n" +
+    "node symbol10.cjs doctor\n" +
+    "node symbol10.cjs autotune <archive>\n" +
+    "node symbol10.cjs adaptive-unpack <archive> <file>\n" +
+    "node symbol10.cjs fpga-unpack <archive> <file> <trusted-driver-module|simulator>\n" +
     "node symbol10.cjs firmware <emulator|serial> <archive> <file|-> <executable|port>\n" +
     "node symbol10.cjs v2 <pack|verify|unpack|read|info> ...\n" +
     "node symbol10.cjs v3 <pack|unpack|read|verify|repair> ...\n" +
@@ -823,6 +904,18 @@ const commandUsage = new Map(usage.split("\n").map(line => [line.split(" ")[2], 
 async function main(args) {
     const [command, ...values] = args;
     if (!command || command === "--help") return console.log(usage);
+    if (command === "doctor" && values.length===0) return require("./platform.cjs").doctor();
+    if (command === "autotune" && values.length===1)
+        return require("./platform.cjs").autotune(values[0],openArchive);
+    if (command === "adaptive-unpack" && values.length===2) {
+        const result=require("./platform.cjs").autotune(values[0],openArchive);
+        return extract(values[0],values[1],0,undefined,result.selected,1,result.selected!==false);
+    }
+    if (command === "fpga-unpack" && values.length===3) {
+        const reader=openArchive(values[0],{fpgaDriver:values[2]});
+        try{await publishFile(values[1],fd=>reader.writeTo(fd));}finally{reader.close();}
+        return;
+    }
     if (command === "v2") return require("./archive-v2.cjs").main(values);
     if (command === "v3") return require("./archive-v3.cjs").main(values);
     if (command === "bitline") return require("./language/bitline.cjs").main(values);
@@ -908,7 +1001,7 @@ async function main(args) {
         await extract(values[0], null, 0, undefined, useGpu, decodeWorkers, gpuPipeline);
         console.log("Archive verified");
     } else if (command === "bench-decode" && values.length === 1) {
-        benchmarkDecode(values[0], useGpu, minimumSeconds, gpuPipeline);
+        await benchmarkDecode(values[0], useGpu, minimumSeconds, gpuPipeline);
     } else if (command === "bench" && values.length === 1) {
         await bench(values[0]);
     } else if (command === "self-test" && values.length === 0) {

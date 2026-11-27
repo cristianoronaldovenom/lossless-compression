@@ -1,8 +1,16 @@
+#ifndef S10_COALESCED_BINARY
+#define S10_COALESCED_BINARY 0
+#endif
 // A work-group shares one decoded palette across approximately 4 KiB of adjacent output.
 __kernel void expand(__global const uchar *bytes, __global const uint *jobs,
                      __global const ushort *inverse, __global uint *out) {
     uint row = get_global_id(1);
     __global const uint *job = jobs + DESCRIPTOR_WORDS * row;
+#if S10_COALESCED_BINARY
+    __local uint wordTable[80];
+#else
+    __local uint binaryLo[16], binaryHi[16];
+#endif
     uint width = job[3], size = job[4], lane = get_local_id(0);
     uint lanes = get_local_size(0);
     uint count = (size * 8 + 9) / 10;
@@ -27,6 +35,90 @@ __kernel void expand(__global const uchar *bytes, __global const uint *jobs,
             uint skip = (word % 5) * 2;
             target[word] = (value >> skip) | (value << (10 - skip)) |
                 (value << (20 - skip)) | (value << (30 - skip));
+        }
+        return;
+    }
+
+    // One work-item expands 16 symbols into five adjacent output words.
+    // Tile starts are multiples of five words. Four 40-bit LUT entries
+    // form exactly 160 bits; two compressed bytes are fetched only once.
+    if (width == 1) {
+        uint off = job[0];
+        uint id0 = (uint)bytes[off] | ((uint)bytes[off+1] << 8);
+        uint id1 = (uint)bytes[off+2] | ((uint)bytes[off+3] << 8);
+        if (id0 >= SYMBOL_COUNT || id1 >= SYMBOL_COUNT || id0 == id1 || job[2] != 2) {
+            if (lane == 0) atomic_or(error, 1);
+            return;
+        }
+        uint a = inverse[id0], b = inverse[id1];
+        // One output word per lane: contiguous stores across a warp/wave.
+        // Five word phases repeat every 160 bits. Each of the 16 possible
+        // four-index patterns maps to one already shifted 32-bit word.
+#if S10_COALESCED_BINARY
+        for(uint k=lane;k<80;k+=lanes){
+            uint phase=k>>4, bits=k&15, skip=phase*2;
+            uint v0=bits&1?b:a,v1=bits&2?b:a,v2=bits&4?b:a,v3=bits&8?b:a;
+            wordTable[k]=(v0>>skip)|(v1<<(10-skip))|(v2<<(20-skip))|(v3<<(30-skip));
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __global const uchar *idx=bytes+job[1];
+#if S10_COALESCED_BINARY == 2
+        // Four adjacent words, one guarded input load, one vector store.
+        uint fullLimit=(min(limit,words-1)/4)*4;
+        for(uint word=first+4*lane;word<fullLimit;word+=4*lanes){
+            uint symbol=word*32/10, phase=word%5;
+            uint packed=as_uint(vload4(0,idx+(symbol>>3)))>>(symbol&7);
+            uint base=phase*2;
+            uint k0=packed&15, k1=(packed>>((base+32)/10))&15;
+            uint k2=(packed>>((base+64)/10))&15, k3=(packed>>((base+96)/10))&15;
+            vstore4((uint4)(wordTable[phase*16+k0],wordTable[((phase+1)%5)*16+k1],
+                wordTable[((phase+2)%5)*16+k2],wordTable[((phase+3)%5)*16+k3]),0,target+word);
+        }
+#else
+        uint fullLimit=min(limit,words-1);
+        for(uint word=first+lane;word<fullLimit;word+=lanes){
+            uint symbol=word*32/10, q=symbol>>3;
+            uint key=(((uint)idx[q]|((uint)idx[q+1]<<8))>>(symbol&7))&15;
+            target[word]=wordTable[(word%5)*16+key];
+        }
+#endif
+#else
+        for (uint k = lane; k < 16; k += lanes) {
+            uint v0 = k & 1 ? b : a, v1 = k & 2 ? b : a;
+            uint v2 = k & 4 ? b : a, v3 = k & 8 ? b : a;
+            binaryLo[k] = v0 | (v1 << 10) | (v2 << 20) | (v3 << 30);
+            binaryHi[k] = v3 >> 2;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __global const uchar *idx = bytes + job[1];
+        uint fullLimit = min(limit / 5, size / 20) * 5;
+        for (uint word = first + 5 * lane; word < fullLimit; word += 5 * lanes) {
+            uint q = (word / 5) * 2;
+            uint x = idx[q], y = idx[q+1];
+            uint k0 = x & 15, k1 = x >> 4, k2 = y & 15, k3 = y >> 4;
+            uint l0 = binaryLo[k0], l1 = binaryLo[k1], l2 = binaryLo[k2], l3 = binaryLo[k3];
+            uint h0 = binaryHi[k0], h1 = binaryHi[k1], h2 = binaryHi[k2], h3 = binaryHi[k3];
+            vstore4((uint4)(l0, h0 | (l1 << 8),
+                (l1 >> 24) | (h1 << 8) | (l2 << 16),
+                (l2 >> 16) | (h2 << 16) | (l3 << 24)), 0, target + word);
+            target[word+4] = (l3 >> 8) | (h3 << 24);
+        }
+#endif
+        // Partial unit: never interpret bits beyond the logical symbol count.
+        for (uint word = max(first, fullLimit) + lane; word < limit; word += lanes) {
+            uint symbol = word * 32 / 10, skip = (word % 5) * 2;
+            uint remaining = min(4u, count-symbol);
+            uint q = symbol >> 3;
+            uint key = ((uint)idx[q] | ((uint)idx[q+1] << 8)) >> (symbol & 7);
+            uint v0 = key & 1 ? b : a;
+            uint v1 = remaining > 1 ? (key & 2 ? b : a) : 0;
+            uint v2 = remaining > 2 ? (key & 4 ? b : a) : 0;
+            uint v3 = remaining > 3 ? (key & 8 ? b : a) : 0;
+            if (word + 1 == words) {
+                uint last = remaining == 1 ? v0 : remaining == 2 ? v1 : remaining == 3 ? v2 : v3;
+                if (last >> (size * 8 - 10 * (count - 1))) atomic_or(error, 2);
+            }
+            target[word] = (v0 >> skip) | (v1 << (10-skip)) | (v2 << (20-skip)) | (v3 << (30-skip));
         }
         return;
     }

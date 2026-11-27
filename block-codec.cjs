@@ -1,6 +1,8 @@
 "use strict";
 
 const zlib = require("node:zlib");
+const { expandBinary, expandBinaryInto, expandWideNative } = require("./binary-palette.cjs");
+const { encodeBinary } = require("./binary-encode.cjs");
 
 const SYMBOL_COUNT = 1024;
 const CHUNK_BYTES = 65536;
@@ -30,6 +32,10 @@ function encodePalette(raw, dictionary) {
         const symbol = dictionary.forward[0];
         return Uint8Array.of(1, 0, symbol & 255, symbol >>> 8);
     }
+    if (process.env.S10_DISABLE_BINARY_ENCODE !== "1") {
+        const binary = encodeBinary(raw, dictionary.forward);
+        if (binary) return binary;
+    }
     const count = Math.ceil(raw.length * 8 / 10);
     let workspace = workspaces.get(dictionary);
     if (!workspace) {
@@ -48,15 +54,15 @@ function encodePalette(raw, dictionary) {
             bits |= raw[cursor++] << available;
             available += 8;
         }
-        const symbol = dictionary.forward[bits & 1023];
+        const value = bits & 1023;
         bits >>>= 10;
         available -= 10;
-        if (lookup[symbol] === 0) {
-            lookup[symbol] = palette.push(symbol);
+        if (lookup[value] === 0) {
+            lookup[value] = palette.push(dictionary.forward[value]);
             const width = 32 - Math.clz32(palette.length - 1);
             if (2 + palette.length * 2 + Math.ceil(count * width / 8) >= raw.length) return null;
         }
-        indices[index] = lookup[symbol] - 1;
+        indices[index] = lookup[value] - 1;
     }
     const width = 32 - Math.clz32(palette.length - 1);
     const payload = new Uint8Array(2 + palette.length * 2 + Math.ceil(count * width / 8));
@@ -91,17 +97,27 @@ function paletteLayout(payload, rawLength) {
     if (paletteLength < 1 || paletteLength > SYMBOL_COUNT || paletteLength > count ||
         payload.length !== paletteEnd + Math.ceil(indexBits / 8)) throw new Error("Invalid palette layout");
     if ((indexBits & 7) && (payload[payload.length - 1] >>> (indexBits & 7))) throw new Error("Invalid index padding");
-    const seen = new Uint8Array(SYMBOL_COUNT);
-    for (let index = 0; index < paletteLength; index++) {
-        const symbol = view.getUint16(2 + 2 * index, true);
-        if (symbol >= SYMBOL_COUNT || seen[symbol]) throw new Error("Invalid palette symbol");
-        seen[symbol] = 1;
+    if (paletteLength <= 2) {
+        const a = view.getUint16(2, true);
+        const b = paletteLength === 2 ? view.getUint16(4, true) : -1;
+        if (a >= SYMBOL_COUNT || b >= SYMBOL_COUNT || a === b) throw Error("Invalid palette symbol");
+    } else {
+        const seen = new Uint8Array(SYMBOL_COUNT);
+        for (let index = 0; index < paletteLength; index++) {
+            const symbol = view.getUint16(2 + 2 * index, true);
+            if (symbol >= SYMBOL_COUNT || seen[symbol]) throw new Error("Invalid palette symbol");
+            seen[symbol] = 1;
+        }
     }
     return { view, count, width, paletteLength, paletteEnd };
 }
 
 function decodePalette(payload, rawLength, dictionary) {
     const { view, count, width, paletteLength, paletteEnd } = paletteLayout(payload, rawLength);
+    if (width === 1 && process.env.S10_DISABLE_BINARY_FAST !== "1") {
+        return expandBinary(payload.subarray(paletteEnd), rawLength,
+            dictionary.inverse[view.getUint16(2, true)], dictionary.inverse[view.getUint16(4, true)]);
+    }
     const invalid = 0x8000;
     const values = new Uint16Array(1 << width);
     values.fill(invalid, paletteLength);
@@ -116,6 +132,10 @@ function decodePalette(payload, rawLength, dictionary) {
             value, (value >>> 8) | (value << 2), (value >>> 6) | (value << 4),
             (value >>> 4) | (value << 6), value >>> 2
         ]));
+    }
+    if(width>=2){
+        const fast=expandWideNative(payload.subarray(paletteEnd),rawLength,width,values.subarray(0,paletteLength));
+        if(fast)return fast;
     }
     const output = new Uint8Array(rawLength);
     const target = new DataView(output.buffer);
@@ -223,5 +243,40 @@ function decodeBlock(mode, payload, rawLength, dictionary) {
     return raw;
 }
 
-module.exports = { SYMBOL_COUNT, CHUNK_BYTES, RAW, PALETTE, DEFLATE,
+// Direct destination decode for complete blocks. Caller-owned memory must
+// not alias compressed input; partial ranges retain the original path.
+function decodeBlockInto(mode,payload,destination,dictionary){
+    if(!(destination instanceof Uint8Array)||!(payload instanceof Uint8Array)||
+       destination.length<1||destination.length>CHUNK_BYTES)
+        throw Error("Invalid decode destination");
+    if(destination.buffer===payload.buffer&&destination.byteOffset<payload.byteOffset+payload.byteLength&&
+       payload.byteOffset<destination.byteOffset+destination.byteLength)
+        throw Error("Overlapping decode destination");
+    if(mode===RAW){
+        if(payload.length!==destination.length)throw Error("Invalid raw block length");
+        destination.set(payload);return destination;
+    }
+    if(mode===PALETTE && process.env.S10_DISABLE_BINARY_FAST!=="1"){
+        const layout=paletteLayout(payload,destination.length);
+        if(layout.width===0){
+            if(!(dictionary?.inverse instanceof Uint16Array)||dictionary.inverse.length!==SYMBOL_COUNT)
+                throw TypeError("Expected a Symbol10 inverse dictionary");
+            const v=dictionary.inverse[layout.view.getUint16(2,true)];
+            if(v>>>(destination.length*8-10*(layout.count-1)))throw Error("Invalid symbol padding");
+            if(v===0){destination.fill(0);return destination;}
+            const pattern=Buffer.from([v,(v>>>8)|(v<<2),(v>>>6)|(v<<4),(v>>>4)|(v<<6),v>>>2]);
+            Buffer.from(destination.buffer,destination.byteOffset,destination.byteLength).fill(pattern);
+            return destination;
+        }
+        if(layout.width===1){
+            if(!(dictionary?.inverse instanceof Uint16Array)||dictionary.inverse.length!==SYMBOL_COUNT)
+                throw TypeError("Expected a Symbol10 inverse dictionary");
+            return expandBinaryInto(payload.subarray(layout.paletteEnd),destination,
+                dictionary.inverse[layout.view.getUint16(2,true)],dictionary.inverse[layout.view.getUint16(4,true)]);
+        }
+    }
+    destination.set(decodeBlock(mode,payload,destination.length,dictionary));
+    return destination;
+}
+module.exports = { SYMBOL_COUNT, CHUNK_BYTES, RAW, PALETTE, DEFLATE, decodeBlockInto,
     makeDictionary, encodeBlock, decodeBlock, paletteLayout, encodePalette, decodePalette };
