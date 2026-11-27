@@ -1,9 +1,16 @@
+#ifndef S10_COALESCED_BINARY
+#define S10_COALESCED_BINARY 0
+#endif
 // A work-group shares one decoded palette across approximately 4 KiB of adjacent output.
 __kernel void expand(__global const uchar *bytes, __global const uint *jobs,
                      __global const ushort *inverse, __global uint *out) {
     uint row = get_global_id(1);
     __global const uint *job = jobs + DESCRIPTOR_WORDS * row;
+#if S10_COALESCED_BINARY
+    __local uint wordTable[80];
+#else
     __local uint binaryLo[16], binaryHi[16];
+#endif
     uint width = job[3], size = job[4], lane = get_local_id(0);
     uint lanes = get_local_size(0);
     uint count = (size * 8 + 9) / 10;
@@ -44,6 +51,24 @@ __kernel void expand(__global const uchar *bytes, __global const uint *jobs,
             return;
         }
         uint a = inverse[id0], b = inverse[id1];
+        // One output word per lane: contiguous stores across a warp/wave.
+        // Five word phases repeat every 160 bits. Each of the 16 possible
+        // four-index patterns maps to one already shifted 32-bit word.
+#if S10_COALESCED_BINARY
+        for(uint k=lane;k<80;k+=lanes){
+            uint phase=k>>4, bits=k&15, skip=phase*2;
+            uint v0=bits&1?b:a,v1=bits&2?b:a,v2=bits&4?b:a,v3=bits&8?b:a;
+            wordTable[k]=(v0>>skip)|(v1<<(10-skip))|(v2<<(20-skip))|(v3<<(30-skip));
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        __global const uchar *idx=bytes+job[1];
+        uint fullLimit=min(limit,words-1);
+        for(uint word=first+lane;word<fullLimit;word+=lanes){
+            uint symbol=word*32/10, q=symbol>>3;
+            uint key=(((uint)idx[q]|((uint)idx[q+1]<<8))>>(symbol&7))&15;
+            target[word]=wordTable[(word%5)*16+key];
+        }
+#else
         for (uint k = lane; k < 16; k += lanes) {
             uint v0 = k & 1 ? b : a, v1 = k & 2 ? b : a;
             uint v2 = k & 4 ? b : a, v3 = k & 8 ? b : a;
@@ -64,6 +89,7 @@ __kernel void expand(__global const uchar *bytes, __global const uint *jobs,
                 (l2 >> 16) | (h2 << 16) | (l3 << 24)), 0, target + word);
             target[word+4] = (l3 >> 8) | (h3 << 24);
         }
+#endif
         // Partial unit: never interpret bits beyond the logical symbol count.
         for (uint word = max(first, fullLimit) + lane; word < limit; word += lanes) {
             uint symbol = word * 32 / 10, skip = (word % 5) * 2;

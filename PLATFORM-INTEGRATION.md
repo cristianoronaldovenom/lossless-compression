@@ -85,3 +85,22 @@ on each architecture; OS MHz is a snapshot, not a cycle counter. No Pi speed
 is claimed until it is run there. CI includes an ARM64 Linux runner, not a Pi.
 
 Full blocks restored by CPU workers now use caller-owned output slices directly for binary palette mode. Other codecs and partial ranges use the existing decode-and-copy fallback. Portable benchmark CPU usage is measured after the worker-ready barrier, including result delivery; it is process-wide, not a hard utilization cap.
+
+## GPU resident 80 GB/s experiment
+
+The opt-in coalesced binary decoder uses an 80-word local phase lookup table
+and contiguous 32-bit output stores across work-items. The old tiled decoder
+remains the default until physical benchmarks establish which is faster.
+Both preserve the archive format and final-symbol validation. Run:
+
+    npm run bench:gpu:resident -- 0 1024 15
+
+This compares kernels with a 64 MiB output working set and 15 repeated
+resident dispatches. The device-event median excludes launch gaps; device-span
+throughput includes gaps between GPU events; host-launch throughput includes
+host enqueue and synchronization. Separate transfer-included and host SHA-256
+rates are printed. Both GPU paths must match the CPU reference byte-for-byte.
+Choose the faster strategy using S10_GPU_BINARY_KERNEL=coalesced or legacy.
+The resident batch size is separate from ordinary archive batch sizing, and
+is bounded by allocation and device memory limits. No GPU utilization cap,
+GPU-side SHA-256, or 80 GB/s physical result is claimed.

@@ -157,7 +157,7 @@ function listGpus() {
     return devices.map(({ id, platform, dimensions, ...details }) => details);
 }
 
-function createGpu(inverse, index) {
+function createGpu(inverse, index, options = {}) {
     if (!(inverse instanceof Uint16Array) || inverse.length !== SYMBOLS ||
         inverse.some(value => value >= SYMBOLS) || new Set(inverse).size !== SYMBOLS) {
         throw Error("Invalid GPU inverse dictionary");
@@ -172,14 +172,19 @@ function createGpu(inverse, index) {
         throw Error([unavailable, ...failures].join("\n"));
     }
     for (const device of candidates) {
-        try { return new GpuDecoder(inverse, api, device); }
+        try { return new GpuDecoder(inverse, api, device, options); }
         catch (error) { failures.push(device.name + ": " + error.message); }
     }
     throw Error(failures.join("\n"));
 }
 
 class GpuDecoder {
-    constructor(inverse, api, adapter) {
+    constructor(inverse, api, adapter, options={}) {
+        this.binaryKernel=options.binaryKernel??process.env.S10_GPU_BINARY_KERNEL??"legacy";
+        if(!["legacy","coalesced"].includes(this.binaryKernel))throw Error("Invalid GPU binary kernel");
+        this.residentBlocks=options.residentBlocks;
+        if(this.residentBlocks!==undefined&&(!Number.isInteger(this.residentBlocks)||this.residentBlocks<128||this.residentBlocks>2048))
+            throw Error("residentBlocks must be 128..2048");
         this.api = api;
         this.resources = [];
         this.pending = [];
@@ -209,7 +214,8 @@ class GpuDecoder {
                 "-DDESCRIPTOR_WORDS=" + DESCRIPTOR_WORDS,
                 "-DHEADER_WORDS=" + OUTPUT_HEADER_BYTES / 4,
                 "-DSYMBOL_COUNT=" + SYMBOLS,
-                "-DWORDS_PER_GROUP=" + WORDS_PER_GROUP
+                "-DWORDS_PER_GROUP=" + WORDS_PER_GROUP,
+                "-DS10_COALESCED_BINARY=" + Number(this.binaryKernel==="coalesced")
             ].join(" ");
             const built = api.build(program, 1, deviceId, options, null, null);
             if (built !== 0) {
@@ -232,12 +238,15 @@ class GpuDecoder {
             this.groupSize = preferred > 0 && preferred <= cap ? Math.floor(cap / preferred) * preferred : cap;
             this.localSize = sizeArray(this.groupSize, 1);
             const allocation = Number(deviceInfo(api, device, 0x1010, 8).readBigUInt64LE());
-            this.batchBlocks = requestedBatch(Math.min(adapter.unified ? SHARED_MEMORY_BATCH_BLOCKS : MAX_BATCH_BLOCKS,
-                Math.floor((allocation - OUTPUT_HEADER_BYTES) / CHUNK)));
+            const safeBlocks=Math.min(Math.floor((allocation-Math.max(OUTPUT_HEADER_BYTES,INPUT_GUARD_BYTES))/CHUNK),
+                Math.floor(adapter.globalMemoryBytes/(8*CHUNK)));
+            this.batchBlocks=this.residentBlocks===undefined?
+                requestedBatch(Math.min(adapter.unified?SHARED_MEMORY_BATCH_BLOCKS:MAX_BATCH_BLOCKS,safeBlocks)):
+                Math.min(this.residentBlocks,safeBlocks);
             if (this.batchBlocks < 1) throw Error("GPU allocation limit is too small");
             const allocate = (flags, bytes) => own("MemObject", api.buffer, context, flags, bytes, null);
             const dictionary = allocate(4, inverse.byteLength);
-            this.pipelineSlots = process.env.S10_GPU_SLOTS === "1" ? 1 : 2;
+            this.pipelineSlots = this.residentBlocks!==undefined||process.env.S10_GPU_SLOTS === "1" ? 1 : 2;
             for (let i = 0; i < this.pipelineSlots; i++) {
                 const slot = {
                     queue: i === 0 ? queue : own("CommandQueue", api.queue, context, device, 2),
@@ -349,6 +358,52 @@ class GpuDecoder {
         } finally {
             this.api.releaseEvent(handle);
             slot.busy = false;
+        }
+    }
+
+    // Benchmark-only: input and descriptors stay in device memory.
+    // The archive path still performs ordinary checked readback.
+    benchmarkResident(payload,descriptors,count,iterations=15){
+        if(this.residentBlocks===undefined||this.pending.length)throw Error("Use a dedicated resident benchmark decoder");
+        if(!Number.isInteger(iterations)||iterations<3||iterations>100)throw Error("Invalid resident iteration count");
+        if(descriptors.length!==count*DESCRIPTOR_WORDS||Array.from({length:count},(_,i)=>descriptors[i*DESCRIPTOR_WORDS+4]).some(n=>n!==CHUNK))
+            throw Error("Resident benchmark requires complete blocks");
+        this.submit(payload,descriptors,count);
+        const slot=this.pending[0].slot;
+        const first=this.finish(); // Warm device and validate status.
+        const globalSize=sizeArray(Math.ceil(CHUNK/(WORDS_PER_GROUP*4))*this.groupSize,count);
+        const handles=[];
+        const stamp=(event,key)=>{
+            const value=Buffer.alloc(8);
+            checked(this.api.profile(event,key,8,value,null),"Read GPU event timing");
+            return value.readBigUInt64LE();
+        };
+        const startWall=process.hrtime.bigint();
+        try{
+            for(let i=0;i<iterations;i++){
+                const event=Buffer.alloc(8);
+                checked(this.api.run(slot.queue,slot.kernel,2,null,globalSize,this.localSize,0,null,event),"Resident decode dispatch");
+                handles.push(event.readBigUInt64LE());
+            }
+            checked(this.api.finishQueue(slot.queue),"Wait for resident kernels");
+            const wallNs=Number(process.hrtime.bigint()-startWall);
+            const spans=handles.map(e=>[stamp(e,0x1282),stamp(e,0x1283)]);
+            const ns=spans.map(([a,b])=>Number(b-a));
+            if(ns.some(n=>n<=0))throw Error("Invalid device timing");
+            const spanNs=Number(spans.at(-1)[1]-spans[0][0]);
+            if(spanNs<=0||wallNs<=0)throw Error("Invalid benchmark timing span");
+            const final=Buffer.allocUnsafeSlow(OUTPUT_HEADER_BYTES+count*CHUNK);
+            this.read(slot.queue,slot.output,final);
+            if(final.readUInt32LE()||!first.equals(final.subarray(OUTPUT_HEADER_BYTES)))
+                throw Error("Resident output changed or failed validation");
+            const bytes=count*CHUNK, ordered=ns.slice().sort((a,b)=>a-b);
+            return {output:first,bytes,iterations,kernelTimesNs:ns,
+                medianKernelGBps:bytes/ordered[Math.floor(ordered.length/2)],
+                deviceSpanGBps:bytes*iterations/spanNs,hostLaunchGBps:bytes*iterations/wallNs,
+                note:"Resident raw expansion; excludes input upload, output download and SHA-256"};
+        }finally{
+            this.api.finishQueue(slot.queue);
+            for(const h of handles)this.api.releaseEvent(h);
         }
     }
 
