@@ -6,7 +6,7 @@ const {encodeBinaryNative}=require("./binary-palette.cjs");
 function encodeBinary(raw, forward) {
     if (process.env.S10_BINARY_REFERENCE === "1" || raw.length < 16 || raw.length > 65536)
         return oldEncode(raw,forward);
-    if(process.env.S10_ENABLE_NATIVE_ENCODE==="1"){
+    if(process.env.S10_ENABLE_NATIVE_ENCODE!=="0"){
         const native=encodeBinaryNative(raw,forward);
         if(native!==undefined)return native;
     }

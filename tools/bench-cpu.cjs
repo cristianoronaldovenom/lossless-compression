@@ -29,15 +29,15 @@ function work(o){
 }
 async function trial(options,workers){
  const gate=new Int32Array(new SharedArrayBuffer(4)),pool=[];let ready=0,start;
- const previous=process.env.S10_CPU_KERNEL;process.env.S10_CPU_KERNEL=options.kernel;
+ 
  try{
   const r=await Promise.all(Array.from({length:workers},(_,id)=>new Promise((resolve,reject)=>{
-   const w=new Worker(__filename,{workerData:{...options,id,gate}});pool.push(w);
+   const w=new Worker(__filename,{workerData:{...options,id,gate},env:{...process.env,S10_CPU_KERNEL:options.kernel}});pool.push(w);
    w.on("error",reject);w.on("exit",code=>{if(code!==0)reject(Error("Worker exit "+code));});
    w.on("message",m=>{if(m.ready){if(++ready===workers){start=performance.now();Atomics.store(gate,0,1);Atomics.notify(gate,0);}}else resolve(m);});
   })));
   return r.reduce((s,x)=>s+x.bytes,0)/((Math.max(...r.map(x=>x.finished))-start)/1000)/1e9;
- }finally{Atomics.store(gate,0,1);Atomics.notify(gate,0);await Promise.allSettled(pool.map(w=>w.terminate()));if(previous===undefined)delete process.env.S10_CPU_KERNEL;else process.env.S10_CPU_KERNEL=previous;}
+ }finally{Atomics.store(gate,0,1);Atomics.notify(gate,0);await Promise.allSettled(pool.map(w=>w.terminate()));}
 }
 async function main(){
  const cpus=os.availableParallelism?.()??os.cpus().length,workers=Number(process.argv[2]??Math.min(4,cpus)),mib=Number(process.argv[3]??256),seconds=Number(process.argv[4]??1);

@@ -15,6 +15,24 @@
 #define S10_X86_TARGET 0
 #endif
 namespace s10cpu {
+inline uint64_t read40(const uint8_t* p){
+ return uint64_t(p[0])|uint64_t(p[1])<<8|uint64_t(p[2])<<16|uint64_t(p[3])<<24|uint64_t(p[4])<<32;
+}
+inline unsigned distinguishing_bit(uint32_t a,uint32_t b){
+ unsigned pick=0;uint32_t d=a^b;while(d&&!(d&1)){d>>=1;++pick;}return pick;
+}
+inline bool pack_scalar(const uint8_t* raw,uint8_t* packed,size_t start,size_t groups,uint32_t a,uint32_t b){
+ constexpr uint64_t mask=0x40100401ULL;const uint64_t base=uint64_t(a)*mask,delta=a^b;
+ const unsigned pick=distinguishing_bit(a,b);
+ uint64_t table[16];for(unsigned m=0;m<16;m++)table[m]=(uint64_t(m&1)|uint64_t(m&2)<<9|uint64_t(m&4)<<18|uint64_t(m&8)<<27)*delta;
+ for(size_t i=start;i<groups;i++){
+  const uint64_t x=read40(raw+5*i)^base,y=x>>pick;
+  const unsigned m=unsigned((y&1)|((y>>9)&2)|((y>>18)&4)|((y>>27)&8));
+  if(x!=table[m])return false;
+  packed[i/2]|=uint8_t(m<<((i&1)*4));
+ }
+ return true;
+}
 inline bool has_bmi2(){
 #if S10_X86_TARGET && defined(_MSC_VER)
  int r[4];__cpuid(r,0);if(r[0]<7)return false;__cpuidex(r,7,0);return (r[1]&(1<<8))!=0;
@@ -36,6 +54,17 @@ inline bool has_avx2(){
 #endif
 }
 #if S10_X86_TARGET
+S10_TARGET("bmi2") inline bool pack_bmi2(const uint8_t* raw,uint8_t* packed,size_t start,size_t groups,uint32_t a,uint32_t b){
+ constexpr uint64_t mask=0x40100401ULL;const uint64_t base=uint64_t(a)*mask,delta=a^b;
+ const unsigned pick=distinguishing_bit(a,b);const uint64_t selector=mask<<pick;
+ uint64_t table[16];for(unsigned m=0;m<16;m++)table[m]=_pdep_u64(m,mask)*delta;
+ for(size_t i=start;i<groups;i++){
+  const uint64_t x=read40(raw+5*i)^base;const unsigned m=unsigned(_pext_u64(x,selector));
+  if(x!=table[m])return false;
+  packed[i/2]|=uint8_t(m<<((i&1)*4));
+ }
+ return true;
+}
 S10_TARGET("bmi2") inline size_t bmi2(const uint8_t* in,uint8_t* out,size_t full,uint32_t a,uint32_t b){
  constexpr uint64_t mask=0x40100401ULL;
  const uint64_t base=uint64_t(a)*mask,delta=a^b;

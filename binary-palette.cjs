@@ -8,6 +8,15 @@ if (process.env.S10_DISABLE_NATIVE !== "1") {
         if (error.code !== "MODULE_NOT_FOUND" && error.code !== "ERR_DLOPEN_FAILED") throw error;
     }
 }
+let selected;
+function syncCpuKernel(){
+    const k=process.env.S10_CPU_KERNEL??"auto";
+    if(native?.selectCpuKernel&&k!==selected){
+        const modes={auto:0,scalar:1,avx2:2,bmi2:3};
+        if(!Object.hasOwn(modes,k))throw Error("Unknown S10_CPU_KERNEL: "+k);
+        native.selectCpuKernel(modes[k]);selected=k;
+    }
+}
 let cachedKey = -1;
 const table = new Uint32Array(256 * 3);
 function prepare(a, b) {
@@ -36,6 +45,7 @@ function expandBinary(indices, length, a, b, destination) {
     if(destination!==undefined && (!(destination instanceof Uint8Array)||destination.length!==length ||
         (destination.buffer===indices.buffer && destination.byteOffset<indices.byteOffset+indices.byteLength &&
          indices.byteOffset<destination.byteOffset+destination.byteLength)))throw Error("Invalid or overlapping output");
+    if(native)syncCpuKernel();
     if (native && destination===undefined) return native.expand(indices, length, a, b);
     if (native && typeof native.expandInto==="function") return native.expandInto(indices,length,a,b,destination);
     prepare(a, b);
@@ -65,6 +75,7 @@ function expandWideNative(indices,length,width,values){
 }
 function encodeBinaryNative(raw,forward){
     if(typeof native?.encodeBinary!=="function")return undefined;
+    syncCpuKernel();
     const result=native.encodeBinary(raw,forward);
     return result===null?null:new Uint8Array(result.buffer,result.byteOffset,result.byteLength);
 }

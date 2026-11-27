@@ -19,3 +19,30 @@ test("native CPU strategies match independent bitstream and preserve guards",{sk
   }
  }finally{if(prev===undefined)delete process.env.S10_CPU_KERNEL;else process.env.S10_CPU_KERNEL=prev;}
 });
+
+test("native encoding exactness and third-symbol rejection",{skip:!nativeEnabled},()=>{
+ const {encodeBinaryNative}=require("../binary-palette.cjs"),forward=Uint16Array.from({length:1024},(_,i)=>i);
+ const prev=process.env.S10_CPU_KERNEL;let seed=93;const rnd=()=>{seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;return seed>>>0;};
+ try{
+  for(const kernel of ["scalar","auto"]){
+   process.env.S10_CPU_KERNEL=kernel;
+   for(let i=0;i<200;i++){
+    const length=20+5*(rnd()%500),count=length*8/10,a=rnd()&1023;let b=rnd()&1023;if(a===b)b^=1;
+    const bits=Uint8Array.from({length:Math.ceil(count/8)},()=>rnd()&255);
+    if(count&7)bits[bits.length-1]&=(1<<(count&7))-1;
+    bits[0]&=254;bits[0]|=2;
+    const raw=expandBinaryInto(bits,new Uint8Array(length),a,b);
+    const encoded=encodeBinaryNative(raw,forward);
+    assert.equal(encoded[0],2);assert.equal(encoded[2]|encoded[3]<<8,a);assert.equal(encoded[4]|encoded[5]<<8,b);
+    assert.deepEqual(encoded.subarray(6),bits);
+    const bad=raw.slice();let third=(a+1)&1023;while(third===a||third===b)third=(third+1)&1023;
+    bad[0]=third&255;bad[1]=(bad[1]&252)|(third>>8);
+    // Preserve both original values after changing first symbol.
+    bad[2]=(bad[2]&15)|((a&15)<<4); // replace a full symbol at bit 20 instead
+    bad[3]=(bad[3]&192)|(a>>4);
+    // bit 10 is b (forced above), bit 20 is a, bit 0 is third.
+    assert.equal(encodeBinaryNative(bad,forward),null);
+   }
+  }
+ }finally{if(prev===undefined)delete process.env.S10_CPU_KERNEL;else process.env.S10_CPU_KERNEL=prev;}
+});

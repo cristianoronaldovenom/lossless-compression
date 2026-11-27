@@ -6,6 +6,7 @@
 #include "cpu-expand.h"
 
 namespace {
+thread_local unsigned selected_kernel=0;
 struct Cache {
     uint32_t key = 0xffffffffu;
     std::array<std::array<uint8_t, 10>, 256> entries{};
@@ -74,11 +75,10 @@ napi_value expand(napi_env env, napi_callback_info info) {
     // Opt-in or automatic CPU ISA selection. No AVX instruction executes
     // on an unsupported CPU. Scalar remains a reference and fallback.
     static const bool avx=s10cpu::has_avx2(),bmi=s10cpu::has_bmi2();
-    const char* requested=std::getenv("S10_CPU_KERNEL");
 #if S10_X86_TARGET
-    if((!requested||std::strcmp(requested,"auto")==0||std::strcmp(requested,"avx2")==0)&&avx)
+    if((selected_kernel==0||selected_kernel==2)&&avx)
         i=s10cpu::avx2(input,out,full,a,b);
-    else if(requested&&std::strcmp(requested,"bmi2")==0&&bmi)
+    else if(selected_kernel==3&&bmi)
         i=s10cpu::bmi2(input,out,full,a,b);
 #endif
     if(i==full&&length%10==0)return result;
@@ -193,16 +193,25 @@ napi_value encode_binary(napi_env env,napi_callback_info info){
         if(v!=b)return false;
         mask|=uint8_t(1u<<j);return true;
     };
-    for(size_t i=0;i<groups;i++){
-        const uint8_t* p=raw+i*5;
-        const uint32_t low=uint32_t(p[0])|uint32_t(p[1])<<8|uint32_t(p[2])<<16|uint32_t(p[3])<<24;
-        const uint32_t x=low&1023,y=(low>>10)&1023,z=(low>>20)&1023,w=(low>>30)|(uint32_t(p[4])<<2);
+    size_t i=0;
+    const uint64_t base=uint64_t(a)*0x40100401ULL;
+    for(;i<groups;i++){
+        const uint64_t word=s10cpu::read40(raw+i*5);
+        if(word==base)continue;
         uint8_t mask=0;
-        if(b!=1024){
-            if((x!=a&&x!=b)||(y!=a&&y!=b)||(z!=a&&z!=b)||(w!=a&&w!=b))return result;
-            mask=uint8_t((x==b)|((y==b)<<1)|((z==b)<<2)|((w==b)<<3));
-        }else if(!classify(x,0,mask)||!classify(y,1,mask)||!classify(z,2,mask)||!classify(w,3,mask))return result;
+        for(unsigned j=0;j<4;j++)if(!classify(uint32_t(word>>(10*j))&1023,j,mask))return result;
         packed[6+i/2]|=uint8_t(mask<<((i&1)*4));
+        ++i;break;
+    }
+    if(b!=1024){
+        bool ok;
+#if S10_X86_TARGET
+        static const bool bmi=s10cpu::has_bmi2();
+        if(bmi&&selected_kernel!=1)ok=s10cpu::pack_bmi2(raw,packed.data()+6,i,groups,a,b);
+        else
+#endif
+        ok=s10cpu::pack_scalar(raw,packed.data()+6,i,groups,a,b);
+        if(!ok)return result;
     }
     if(n%5){
         uint32_t low=0;for(size_t j=0;j<n%5;j++)low|=uint32_t(raw[groups*5+j])<<(j*8);
@@ -218,6 +227,12 @@ napi_value encode_binary(napi_env env,napi_callback_info info){
         packed[4]=uint8_t(sb);packed[5]=uint8_t(sb>>8);}
     if(napi_create_buffer_copy(env,bytes,packed.data(),nullptr,&result)!=napi_ok)return fail(env,"Cannot allocate encoded output");
     return result;
+}
+napi_value select_cpu_kernel(napi_env env,napi_callback_info info){
+    size_t argc=1;napi_value arg,result;uint32_t mode=0;
+    if(napi_get_cb_info(env,info,&argc,&arg,nullptr,nullptr)!=napi_ok||argc!=1||
+       napi_get_value_uint32(env,arg,&mode)!=napi_ok||mode>3)return fail(env,"Invalid CPU kernel");
+    selected_kernel=mode;napi_get_undefined(env,&result);return result;
 }
 napi_value cpu_capabilities(napi_env env,napi_callback_info){
     napi_value result,value;napi_create_object(env,&result);
@@ -236,6 +251,8 @@ napi_value init(napi_env env, napi_value exports) {
        napi_set_named_property(env,exports,"encodeBinary",fn)!=napi_ok)return fail(env,"Cannot initialize native encoder");
     if(napi_create_function(env,"cpuCapabilities",NAPI_AUTO_LENGTH,cpu_capabilities,nullptr,&fn)!=napi_ok||
        napi_set_named_property(env,exports,"cpuCapabilities",fn)!=napi_ok)return fail(env,"Cannot initialize CPU capabilities");
+    if(napi_create_function(env,"selectCpuKernel",NAPI_AUTO_LENGTH,select_cpu_kernel,nullptr,&fn)!=napi_ok||
+       napi_set_named_property(env,exports,"selectCpuKernel",fn)!=napi_ok)return fail(env,"Cannot initialize CPU selection");
     return exports;
 }
 }
