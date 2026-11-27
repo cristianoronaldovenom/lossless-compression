@@ -14,7 +14,7 @@ function fixture(count){
         const pos=row*STRIDE, a=rand()&1023;let b=rand()&1023;
         if(a===b)b^=1;
         // A full 65536 byte block has a partially used final 10-bit symbol.
-        // Pick a value fitting its six available bits, then force its index.
+        // Pick a value fitting the available final bits, then force its index.
         const aa=a&63,bb=b===aa?(b^64):b;
         payload.writeUInt16LE(aa,pos);payload.writeUInt16LE(bb,pos+2);
         const idx=payload.subarray(pos+4,pos+4+I);
@@ -33,7 +33,7 @@ function main(){
         !Number.isInteger(iterations)||iterations<3||iterations>100)throw Error("Usage: bench-gpu-resident.cjs [device] [128..2048 blocks] [3..100 iterations]");
     const devices=listGpus();console.log(JSON.stringify({type:"devices",devices}));
     let best;
-    for(const binaryKernel of ["legacy","coalesced"]){
+    for(const binaryKernel of ["legacy","coalesced","vector4"]){
         const gpu=createGpu(Uint16Array.from({length:1024},(_,i)=>i),index,{binaryKernel,residentBlocks:blocks});
         try{
             const count=gpu.batchBlocks,{payload,jobs,expected}=fixture(count);

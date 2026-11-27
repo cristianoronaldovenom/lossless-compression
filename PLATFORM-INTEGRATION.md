@@ -95,12 +95,14 @@ Both preserve the archive format and final-symbol validation. Run:
 
     npm run bench:gpu:resident -- 0 1024 15
 
-This compares kernels with a 64 MiB output working set and 15 repeated
+This compares legacy, coalesced and vector4 kernels with a 64 MiB output working set and 15 repeated
 resident dispatches. The device-event median excludes launch gaps; device-span
 throughput includes gaps between GPU events; host-launch throughput includes
 host enqueue and synchronization. Separate transfer-included and host SHA-256
-rates are printed. Both GPU paths must match the CPU reference byte-for-byte.
-Choose the faster strategy using S10_GPU_BINARY_KERNEL=coalesced or legacy.
+rates are printed. All three GPU paths must match the CPU reference byte-for-byte.
+Choose the faster strategy using S10_GPU_BINARY_KERNEL=coalesced, vector4 or legacy.
 The resident batch size is separate from ordinary archive batch sizing, and
 is bounded by allocation and device memory limits. No GPU utilization cap,
 GPU-side SHA-256, or 80 GB/s physical result is claimed.
+
+Vector4 obtains four phase keys from one guarded 32-bit compressed-input load and issues a 16-byte vector store. Actual memory transactions depend on the device compiler and must be measured.

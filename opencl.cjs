@@ -181,7 +181,7 @@ function createGpu(inverse, index, options = {}) {
 class GpuDecoder {
     constructor(inverse, api, adapter, options={}) {
         this.binaryKernel=options.binaryKernel??process.env.S10_GPU_BINARY_KERNEL??"legacy";
-        if(!["legacy","coalesced"].includes(this.binaryKernel))throw Error("Invalid GPU binary kernel");
+        if(!["legacy","coalesced","vector4"].includes(this.binaryKernel))throw Error("Invalid GPU binary kernel");
         this.residentBlocks=options.residentBlocks;
         if(this.residentBlocks!==undefined&&(!Number.isInteger(this.residentBlocks)||this.residentBlocks<128||this.residentBlocks>2048))
             throw Error("residentBlocks must be 128..2048");
@@ -202,6 +202,8 @@ class GpuDecoder {
         };
         try {
             const device = adapter.id;
+            if(this.binaryKernel!=="legacy"&&deviceInfo(api,device,0x1023,8).readBigUInt64LE()<2368n)
+                throw Error("Insufficient local memory for phase lookup table");
             const deviceId = sizeArray(device);
             this.name = adapter.name;
             const context = own("Context", api.context, sizeArray(0x1084, adapter.platform, 0), 1, deviceId, null, null);
@@ -215,7 +217,7 @@ class GpuDecoder {
                 "-DHEADER_WORDS=" + OUTPUT_HEADER_BYTES / 4,
                 "-DSYMBOL_COUNT=" + SYMBOLS,
                 "-DWORDS_PER_GROUP=" + WORDS_PER_GROUP,
-                "-DS10_COALESCED_BINARY=" + Number(this.binaryKernel==="coalesced")
+                "-DS10_COALESCED_BINARY=" + ({legacy:0,coalesced:1,vector4:2}[this.binaryKernel])
             ].join(" ");
             const built = api.build(program, 1, deviceId, options, null, null);
             if (built !== 0) {

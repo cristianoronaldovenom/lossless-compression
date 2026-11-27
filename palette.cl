@@ -62,12 +62,26 @@ __kernel void expand(__global const uchar *bytes, __global const uint *jobs,
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         __global const uchar *idx=bytes+job[1];
+#if S10_COALESCED_BINARY == 2
+        // Four adjacent words, one guarded input load, one vector store.
+        uint fullLimit=(min(limit,words-1)/4)*4;
+        for(uint word=first+4*lane;word<fullLimit;word+=4*lanes){
+            uint symbol=word*32/10, phase=word%5;
+            uint packed=as_uint(vload4(0,idx+(symbol>>3)))>>(symbol&7);
+            uint base=phase*2;
+            uint k0=packed&15, k1=(packed>>((base+32)/10))&15;
+            uint k2=(packed>>((base+64)/10))&15, k3=(packed>>((base+96)/10))&15;
+            vstore4((uint4)(wordTable[phase*16+k0],wordTable[((phase+1)%5)*16+k1],
+                wordTable[((phase+2)%5)*16+k2],wordTable[((phase+3)%5)*16+k3]),0,target+word);
+        }
+#else
         uint fullLimit=min(limit,words-1);
         for(uint word=first+lane;word<fullLimit;word+=lanes){
             uint symbol=word*32/10, q=symbol>>3;
             uint key=(((uint)idx[q]|((uint)idx[q+1]<<8))>>(symbol&7))&15;
             target[word]=wordTable[(word%5)*16+key];
         }
+#endif
 #else
         for (uint k = lane; k < 16; k += lanes) {
             uint v0 = k & 1 ? b : a, v1 = k & 2 ? b : a;
