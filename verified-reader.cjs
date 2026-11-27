@@ -5,6 +5,31 @@ const {ENTRY_BYTES:E,inspectArchive,readExactly,digest}=require("./archive-forma
 const {bitWindow,extractBits}=require("./bit-access.cjs");
 const MAX_READ=16*1024*1024;
 const sig=s=>[s.dev,s.ino,s.size,s.mtimeNs,s.ctimeNs].join(":");
+
+// A verified, private, immutable-in-API snapshot for asset hot paths.
+// No filesystem calls on each lookup; it represents the bytes at creation,
+// not a live view of the archive. No public backing-buffer access.
+class VerifiedSnapshot {
+ #bytes;
+ constructor(bytes){this.#bytes=bytes;}
+ get size(){return this.#bytes.length;}
+ #check(offset,length){
+  if(!Number.isSafeInteger(offset)||offset<0||!Number.isSafeInteger(length)||length<0||offset>this.size-length)throw RangeError("Invalid snapshot range");
+ }
+ read(offset,length){this.#check(offset,length);return Buffer.from(this.#bytes.subarray(offset,offset+length));}
+ readInto(offset,dest){
+  if(!(dest instanceof Uint8Array))throw TypeError("Expected Uint8Array");
+  this.#check(offset,dest.length);dest.set(this.#bytes.subarray(offset,offset+dest.length));return dest;
+ }
+ readU16LE(offset){this.#check(offset,2);return this.#bytes.readUInt16LE(offset);}
+ readU32LE(offset){this.#check(offset,4);return this.#bytes.readUInt32LE(offset);}
+ readBits(offset,width){
+  const w=bitWindow(offset,width,this.size);
+  let word=0;for(let i=0;i<w.bytes;i++)word+=this.#bytes[w.firstByte+i]*2**(8*i);
+  return Math.floor(word/2**w.shift)%2**width;
+ }
+}
+
 class VerifiedReader{
  #fd;#archive;#dict;#stamp;#cache=new Map();#used=0;#limit;#gpu;#gpuMin;#gpuDisabled=false;#ownsGpu=false;
  #stats={hits:0,misses:0,cpuBlocks:0,gpuBlocks:0,gpuFailures:0,verifiedBytes:0};
@@ -135,6 +160,7 @@ class VerifiedReader{
   const w=bitWindow(offset,width,this.size);return extractBits(this.read(w.firstByte,w.bytes),w.shift,width);
  }
  prefetch(offset,length){this.read(offset,length);return this.stats;}
+ snapshot(offset,length){return new VerifiedSnapshot(this.read(offset,length));}
  close(){
   if(this.#ownsGpu){try{this.#gpu?.close();}finally{this.#ownsGpu=false;if(this.#fd!==undefined){fs.closeSync(this.#fd);this.#fd=undefined;}this.#cache.clear();this.#used=0;}}
   else{if(this.#fd!==undefined){fs.closeSync(this.#fd);this.#fd=undefined;}this.#cache.clear();this.#used=0;}

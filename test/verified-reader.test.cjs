@@ -67,3 +67,16 @@ test("corrupted stored payload never updates destination",()=>{
   assert.throws(()=>r.readInto(0,target));assert.ok(target.every(x=>x===0x5a));
  }finally{r?.close();fs.rmSync(f.dir,{recursive:true,force:true});}
 });
+
+test("verified snapshots support fast typed reads, independent ownership and stable old contents",()=>{
+ const f=fixture();let r;try{
+  r=new VerifiedReader(f.file);const offset=L-11,length=128,s=r.snapshot(offset,length),original=f.raw.subarray(offset,offset+length);
+  for(let i=0;i<length-4;i++){
+   assert.equal(s.readU16LE(i),original.readUInt16LE(i));assert.equal(s.readU32LE(i),original.readUInt32LE(i));
+   for(const w of [1,10,16,32])assert.equal(s.readBits(i*8+3,w),reference(original,i*8+3,w));
+  }
+  const c=s.read(0,20);c.fill(0xff);assert.deepEqual(s.read(0,20),original.subarray(0,20));
+  const d=Buffer.alloc(20);s.readInto(4,d);assert.deepEqual(d,original.subarray(4,24));
+  r.close();assert.equal(s.readU32LE(0),original.readUInt32LE(0));assert.throws(()=>s.readU32LE(length-3));
+ }finally{r?.close();fs.rmSync(f.dir,{recursive:true,force:true});}
+});

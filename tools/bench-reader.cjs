@@ -13,6 +13,13 @@ try{
  }
  samples.sort((a,b)=>a-b);
  console.log(JSON.stringify({phase:"hot random 32-bit reads",unit:"microseconds",p50:samples[Math.floor(samples.length*.5)],p95:samples[Math.floor(samples.length*.95)],p99:samples[Math.floor(samples.length*.99)],guard,stats:r.stats}));
+ const snapshot=r.snapshot(0,hot),lat=[];seed=42;
+ for(let i=0;i<iterations;i++){
+  seed=(Math.imul(seed,1664525)+1013904223)>>>0;
+  const offset=seed%(hot*8-31),t=performance.now();guard^=snapshot.readBits(offset,32);lat.push((performance.now()-t)*1e3);
+ }
+ lat.sort((a,b)=>a-b);
+ console.log(JSON.stringify({phase:"private verified snapshot random 32-bit reads",unit:"microseconds",p50:lat[Math.floor(lat.length*.5)],p95:lat[Math.floor(lat.length*.95)],p99:lat[Math.floor(lat.length*.99)],guard}));
  const t=performance.now();for(let off=0;off<r.size;off+=16*1024*1024)r.read(off,Math.min(16*1024*1024,r.size-off));
  console.log(JSON.stringify({phase:"verified sequential read including storage and copies",GBps:r.size/((performance.now()-t)*1e6),stats:r.stats}));
 }finally{r.close();}
