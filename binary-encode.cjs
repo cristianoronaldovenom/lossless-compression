@@ -1,10 +1,15 @@
 "use strict";
 const oldEncode = require("./binary-encode-reference.cjs").encodeBinary;
+const {encodeBinaryNative}=require("./binary-palette.cjs");
 // A distinguishing bit selects the candidate index. Compare all 40 bits
 // to a precomputed exact pattern to reject any third value.
 function encodeBinary(raw, forward) {
     if (process.env.S10_BINARY_REFERENCE === "1" || raw.length < 16 || raw.length > 65536)
         return oldEncode(raw,forward);
+    if(process.env.S10_ENABLE_NATIVE_ENCODE==="1"){
+        const native=encodeBinaryNative(raw,forward);
+        if(native!==undefined)return native;
+    }
     const view=new DataView(raw.buffer,raw.byteOffset,raw.byteLength);
     const full=Math.floor(raw.length/5), count=Math.ceil(raw.length*8/10);
     const a=view.getUint16(0,true)&1023;

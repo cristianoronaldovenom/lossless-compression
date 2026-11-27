@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
         node: [22, 24]
     runs-on: ${{ matrix.os }}
     steps:
@@ -25,6 +25,9 @@ jobs:
       - run: node -e "if(!require('./binary-palette.cjs').nativeEnabled)process.exit(1)"
       - run: npm test
       - run: node tools/bench-performance.cjs 0.2 3
+      - run: node tools/bench-portable.cjs 1 0.1 1 4
+        env:
+          S10_ENABLE_NATIVE_ENCODE: "1"
   hardware:
     runs-on: ubuntu-latest
     steps:

@@ -61,3 +61,25 @@ caller-owned staging buffers. hardware/s10_dma_stream.v accepts this exact
 128-bit record, checks reserved fields, full input keep and matching TLAST,
 and exposes the existing 512-bit output with keep/last. This is a framing
 wrapper, not a PCIe endpoint, board driver or completed DMA implementation.
+
+## Raspberry Pi 5 and portable CPU calibration
+
+Use 64-bit Raspberry Pi OS (arm64). Install Node 22 or 24, Python 3, make
+and a C++ compiler. Run npm ci, npm run build:native and npm run doctor.
+The portable native encoder is opt-in via S10_ENABLE_NATIVE_ENCODE=1;
+when absent or unavailable the existing JavaScript encoder remains active.
+No architecture-specific instructions are required. Node's OpenSSL selects
+available SHA-256 CPU instructions automatically when supported by the build.
+
+    npm run bench:portable -- 1 0.5 3 32
+    npm run bench:portable -- 4 0.5 3 32
+
+Arguments: worker count, seconds per trial, rounds, 64 KiB blocks per worker.
+Reports binary, text and random input, actual compressed payload ratio,
+encoder, encoder+SHA, allocating decode, reusable binary decode, verified
+decode and hash-only throughput, median/min/max, plus CPU identification.
+Workers synchronize their start. Timing includes result delivery but not
+fixture generation. File I/O and full archive metadata are excluded.
+Clock model divisor = reported MHz * worker count / measured GB/s. Recalibrate
+on each architecture; OS MHz is a snapshot, not a cycle counter. No Pi speed
+is claimed until it is run there. CI includes an ARM64 Linux runner, not a Pi.

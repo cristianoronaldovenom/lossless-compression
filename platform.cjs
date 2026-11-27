@@ -4,8 +4,12 @@ const {performance}=require("node:perf_hooks");
 function hardwareInfo(){
     const info={platform:process.platform,arch:process.arch,node:process.version,
         logicalCPUs:os.availableParallelism?.()??os.cpus().length,memoryBytes:os.totalmem(),
+        cpuModel:os.cpus()[0]?.model??"unknown",reportedMHz:os.cpus().map(c=>c.speed).filter(x=>x>0),
         native:require("./binary-palette.cjs").nativeEnabled,opencl:[]};
     try{info.opencl=require("./opencl.cjs").listGpus();}catch(error){info.openclError=error.message;}
+    if(process.platform==="linux"){
+        try{info.board=require("node:fs").readFileSync("/proc/device-tree/model","utf8").replace(/\0/g,"").trim();}catch{}
+    }
     info.ecoWorkers=Math.max(1,Math.min(16,Math.floor(info.logicalCPUs/4)));
     return info;
 }

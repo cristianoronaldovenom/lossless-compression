@@ -63,4 +63,10 @@ function expandWideNative(indices,length,width,values){
     if(typeof native?.expandPalette!=="function" || process.env.S10_ENABLE_WIDE_NATIVE!=="1" || process.env.S10_DISABLE_WIDE_NATIVE==="1")return null;
     return native.expandPalette(indices,length,width,values);
 }
-module.exports = { expandBinary, expandBinaryInto, expandWideNative, nativeEnabled: Boolean(native) };
+function encodeBinaryNative(raw,forward){
+    if(typeof native?.encodeBinary!=="function")return undefined;
+    const result=native.encodeBinary(raw,forward);
+    return result===null?null:new Uint8Array(result.buffer,result.byteOffset,result.byteLength);
+}
+module.exports = { expandBinary, expandBinaryInto, expandWideNative, encodeBinaryNative,
+    nativeEncoderAvailable:typeof native?.encodeBinary==="function",nativeEnabled: Boolean(native) };

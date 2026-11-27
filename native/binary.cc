@@ -143,6 +143,55 @@ napi_value expand_palette(napi_env env, napi_callback_info info) {
     if(written!=length||output)return fail(env,"Invalid symbol padding");
     return result;
 }
+// Portable packed encoder. No unaligned pointer casts or ISA requirements.
+// Four 10-bit symbols are read from exactly five bytes.
+napi_value encode_binary(napi_env env,napi_callback_info info){
+    size_t argc=2,n,k,offset; napi_value args[2],backing,result;
+    napi_typedarray_type type; void* source=nullptr;void* dictionary=nullptr;
+    if(napi_get_cb_info(env,info,&argc,args,nullptr,nullptr)!=napi_ok||argc!=2||
+       napi_get_typedarray_info(env,args[0],&type,&n,&source,&backing,&offset)!=napi_ok||type!=napi_uint8_array||
+       napi_get_typedarray_info(env,args[1],&type,&k,&dictionary,&backing,&offset)!=napi_ok||type!=napi_uint16_array||k!=1024)
+        return fail(env,"Invalid native encoder arguments");
+    napi_get_null(env,&result);
+    if(n<16||n>65536||!source||!dictionary)return result;
+    const auto* raw=static_cast<const uint8_t*>(source);
+    const auto* forward=static_cast<const uint16_t*>(dictionary);
+    const uint32_t a=(uint32_t(raw[0])|uint32_t(raw[1])<<8)&1023;
+    uint32_t b=1024;
+    const size_t count=(n*8+9)/10,groups=n/5;
+    std::array<uint8_t,6560> packed{};
+    auto classify=[&](uint32_t v,unsigned j,uint8_t& mask){
+        if(v==a)return true;
+        if(b==1024)b=v;
+        if(v!=b)return false;
+        mask|=uint8_t(1u<<j);return true;
+    };
+    for(size_t i=0;i<groups;i++){
+        const uint8_t* p=raw+i*5;
+        const uint32_t low=uint32_t(p[0])|uint32_t(p[1])<<8|uint32_t(p[2])<<16|uint32_t(p[3])<<24;
+        const uint32_t x=low&1023,y=(low>>10)&1023,z=(low>>20)&1023,w=(low>>30)|(uint32_t(p[4])<<2);
+        uint8_t mask=0;
+        if(b!=1024){
+            if((x!=a&&x!=b)||(y!=a&&y!=b)||(z!=a&&z!=b)||(w!=a&&w!=b))return result;
+            mask=uint8_t((x==b)|((y==b)<<1)|((z==b)<<2)|((w==b)<<3));
+        }else if(!classify(x,0,mask)||!classify(y,1,mask)||!classify(z,2,mask)||!classify(w,3,mask))return result;
+        packed[6+i/2]|=uint8_t(mask<<((i&1)*4));
+    }
+    if(n%5){
+        uint32_t low=0;for(size_t j=0;j<n%5;j++)low|=uint32_t(raw[groups*5+j])<<(j*8);
+        uint8_t mask=0;
+        for(unsigned j=0;j<(n%5*8+9)/10;j++)if(!classify((low>>(10*j))&1023,j,mask))return result;
+        packed[6+groups/2]|=uint8_t(mask<<((groups&1)*4));
+    }
+    const size_t bytes=b==1024?4:6+(count+7)/8;
+    if(bytes>=n)return result;
+    const uint32_t sa=forward[a];if(sa>=1024)return fail(env,"Invalid dictionary entry");
+    packed[0]=b==1024?1:2;packed[2]=uint8_t(sa);packed[3]=uint8_t(sa>>8);
+    if(b!=1024){const uint32_t sb=forward[b];if(sb>=1024||sa==sb)return fail(env,"Invalid dictionary entry");
+        packed[4]=uint8_t(sb);packed[5]=uint8_t(sb>>8);}
+    if(napi_create_buffer_copy(env,bytes,packed.data(),nullptr,&result)!=napi_ok)return fail(env,"Cannot allocate encoded output");
+    return result;
+}
 napi_value init(napi_env env, napi_value exports) {
     napi_value fn;
     if (napi_create_function(env, "expand", NAPI_AUTO_LENGTH, expand, nullptr, &fn) != napi_ok ||
@@ -150,6 +199,8 @@ napi_value init(napi_env env, napi_value exports) {
         napi_set_named_property(env, exports, "expandInto", fn) != napi_ok) return fail(env, "Cannot initialize addon");
     if(napi_create_function(env,"expandPalette",NAPI_AUTO_LENGTH,expand_palette,nullptr,&fn)!=napi_ok||
        napi_set_named_property(env,exports,"expandPalette",fn)!=napi_ok)return fail(env,"Cannot initialize palette addon");
+    if(napi_create_function(env,"encodeBinary",NAPI_AUTO_LENGTH,encode_binary,nullptr,&fn)!=napi_ok||
+       napi_set_named_property(env,exports,"encodeBinary",fn)!=napi_ok)return fail(env,"Cannot initialize native encoder");
     return exports;
 }
 }

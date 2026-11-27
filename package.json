@@ -11,7 +11,8 @@
     "test:gpu": "node symbol10.cjs self-test --gpu",
     "bench:core": "node tools/bench-performance.cjs 1 5",
     "doctor": "node symbol10.cjs doctor",
-    "build:native": "npx --yes node-gyp rebuild --directory native"
+    "build:native": "npx --yes node-gyp rebuild --directory native",
+    "bench:portable": "node tools/bench-portable.cjs"
   },
   "optionalDependencies": {
     "koffi": "3.3.8"
